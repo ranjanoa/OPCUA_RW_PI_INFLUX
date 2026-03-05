@@ -221,15 +221,17 @@ class OPCInfluxWorker(QThread):
     data_written = pyqtSignal(str)
     live_data_update = pyqtSignal(str, object)  # UI Signal
 
-    def __init__(self, opc_config, influx_config, selected_tags_nodeids, write_mode, interval_ms):
+    def __init__(self, opc_config, influx_config, selected_tags, write_mode, interval_ms):
         super().__init__()
         self.opc_config = opc_config
         self.influx_config = influx_config
-        self.selected_tags_nodeids = selected_tags_nodeids
+        # selected_tags: {nodeId: tagName}
+        self.selected_tags = selected_tags
+        self.selected_tags_nodeids = list(selected_tags.keys())
         self.write_mode = write_mode
         self.interval_ms = interval_ms
         self._is_running = True
-        self.db_measurement = getattr(config, 'DB_MEASUREMENT', 'kiln1') if config else 'kiln1'
+        self.db_measurement = 'kiln1'
 
     def stop(self):
         self._is_running = False
@@ -259,6 +261,7 @@ class OPCInfluxWorker(QThread):
                     log_samples = []
                     for i, val in enumerate(values):
                         nid = self.selected_tags_nodeids[i]
+                        tag_name = self.selected_tags.get(nid, nid)  # use display name
 
                         try:
                             if isinstance(val, bool):
@@ -268,12 +271,12 @@ class OPCInfluxWorker(QThread):
                         except (ValueError, TypeError):
                             final_val = str(val)
 
-                        point.field(nid, final_val)
+                        point.field(tag_name, final_val)  # <-- tag name, not NodeID
 
-                        # Emit to UI
+                        # Emit to UI (still keyed by NodeID for the tag table)
                         self.live_data_update.emit(nid, final_val)
 
-                        if i < 3: log_samples.append(f"{nid}={final_val}")
+                        if i < 3: log_samples.append(f"{tag_name}={final_val}")
 
                     write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
                     self.data_written.emit(f"✅ Live: {', '.join(log_samples)}...")
@@ -980,8 +983,10 @@ class MainWindow(QMainWindow):
         g_tags = QGroupBox("OPC UA Tags to Monitor")
         l_tags = QVBoxLayout()
         self.selected_tags_tree = QTreeWidget()
-        self.selected_tags_tree.setHeaderLabels(["Tag Name", "NodeID", "Type", "Value"])
-        self.selected_tags_tree.setColumnWidth(0, 200)
+        self.selected_tags_tree.setHeaderLabels(["Tag Name (editable)", "NodeID", "Type", "Value"])
+        self.selected_tags_tree.setColumnWidth(0, 220)
+        self.selected_tags_tree.setToolTip("Double-click Tag Name to rename it (used as InfluxDB field name)")
+        self.selected_tags_tree.itemChanged.connect(self._on_tag_name_changed)
         l_tags.addWidget(self.selected_tags_tree)
 
         h_tags = QHBoxLayout()
@@ -1252,7 +1257,7 @@ class MainWindow(QMainWindow):
 
         conf = {'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
                 'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()}
-        self.opc_worker = OPCInfluxWorker(self._get_opc_config(), conf, list(self.selected_opc_tags.keys()),
+        self.opc_worker = OPCInfluxWorker(self._get_opc_config(), conf, self.selected_opc_tags,
                                           'per_second', self.write_interval_spinbox.value())
         self.opc_worker.log_message.connect(self.log_widget.appendPlainText)
         self.opc_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
@@ -1442,6 +1447,8 @@ class MainWindow(QMainWindow):
             type_str = "[OUTPUT]" if nid in self.output_tags else "[INPUT]"
             item = QTreeWidgetItem([name, nid, type_str, "---"])
             item.setData(1, Qt.ItemDataRole.UserRole, nid)
+            # Allow Tag Name (col 0) to be edited inline by double-clicking
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
             self.selected_tags_tree.addTopLevelItem(item)
             self.tag_item_map[nid] = item
             if nid in self.output_tags: self.write_tag_combo.addItem(f"{name} ({nid})", userData=nid)
@@ -1456,6 +1463,23 @@ class MainWindow(QMainWindow):
             else:
                 val_str = str(value)
             item.setText(3, val_str)
+
+    @pyqtSlot(object, int)
+    def _on_tag_name_changed(self, item, column):
+        """Called when user double-clicks and edits a tag name cell."""
+        if column != 0:
+            return  # only care about Tag Name column
+        nid = item.data(1, Qt.ItemDataRole.UserRole)
+        if not nid:
+            return
+        new_name = item.text(0).strip()
+        if not new_name:
+            # Revert to old name if blank
+            item.setText(0, self.selected_opc_tags.get(nid, nid))
+            return
+        self.selected_opc_tags[nid] = new_name
+        self._save_selections()
+        self.status_bar.showMessage(f"✏️ Renamed → '{new_name}' (InfluxDB field name updated)", 3000)
 
     def _update_write_combo(self):
         has_output = self.write_tag_combo.count() > 0
