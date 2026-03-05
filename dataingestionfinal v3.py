@@ -345,9 +345,12 @@ class SetpointWatcherWorker(QThread):
                             new_cmd[rec.get_field()] = rec.get_value()
 
                     if new_cmd:
-                        if new_cmd != last_cmd:
+                        # Only log if there's actually a new or changed value
+                        if any(last_cmd.get(k) != v for k, v in new_cmd.items()):
                             self.log_msg.emit(f"New Command from kiln2: {new_cmd}")
-                        last_cmd = new_cmd
+                        # Update the persistent dictionary instead of replacing it,
+                        # so that tags older than 1m aren't forgotten and reset to 0
+                        last_cmd.update(new_cmd)
 
                 except Exception as e:
                     self.log_msg.emit(f"Query Error: {e}")
