@@ -362,8 +362,9 @@ class SetpointWatcherWorker(QThread):
                         try:
                             # Protect against indefinite hangs if OPC server drops connection silently
                             node = client.get_node(target_id)
+                            # Use auto-inference (float) instead of strict Double to match node's actual datatype
                             await asyncio.wait_for(
-                                node.write_value(ua.DataValue(ua.Variant(float(val), ua.VariantType.Double))),
+                                node.write_value(float(val)),
                                 timeout=5.0
                             )
                             self.log_msg.emit(f"--> WROTE: {target_id} = {val}")
