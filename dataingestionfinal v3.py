@@ -335,7 +335,8 @@ class SetpointWatcherWorker(QThread):
             while self.running:
                 q = f'from(bucket:"{self.influx_bucket}") |> range(start: -1m) |> filter(fn: (r) => r["_measurement"] == "{self.write_back_meas}") |> last()'
                 try:
-                    tables = query_api.query(q)
+                    # Run synchronous InfluxDB query in a thread to prevent freezing the asyncio loop
+                    tables = await asyncio.to_thread(query_api.query, q)
                     ts = None
                     new_cmd = {}
                     for tbl in tables:
@@ -350,6 +351,8 @@ class SetpointWatcherWorker(QThread):
 
                 except Exception as e:
                     self.log_msg.emit(f"Query Error: {e}")
+                    # Brief pause on error to avoid spamming thread pool
+                    await asyncio.sleep(1)
 
                 # Re-assert ALL last known setpoints every cycle
                 # (prevents simulation engines from resetting values)
@@ -357,8 +360,12 @@ class SetpointWatcherWorker(QThread):
                     target_id = self.allowed_setpoints_map.get(field_name, field_name)
                     if target_id in self.valid_node_ids:
                         try:
+                            # Protect against indefinite hangs if OPC server drops connection silently
                             node = client.get_node(target_id)
-                            await node.write_value(ua.DataValue(ua.Variant(float(val), ua.VariantType.Double)))
+                            await asyncio.wait_for(
+                                node.write_value(ua.DataValue(ua.Variant(float(val), ua.VariantType.Double))),
+                                timeout=5.0
+                            )
                             self.log_msg.emit(f"--> WROTE: {target_id} = {val}")
                         except Exception as e:
                             self.log_msg.emit(f"Write Error {target_id}: {e}")
