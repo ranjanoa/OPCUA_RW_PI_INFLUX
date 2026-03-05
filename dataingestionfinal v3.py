@@ -330,30 +330,39 @@ class SetpointWatcherWorker(QThread):
         try:
             await asyncio.wait_for(client.connect(), timeout=10.0)
             self.log_msg.emit(f"Watcher Active on '{self.write_back_meas}'")
-            last_ts = None
+            last_cmd = {}  # holds last known setpoints to continuously re-assert
 
             while self.running:
                 q = f'from(bucket:"{self.influx_bucket}") |> range(start: -1m) |> filter(fn: (r) => r["_measurement"] == "{self.write_back_meas}") |> last()'
                 try:
                     tables = query_api.query(q)
-                    cmd = {}
                     ts = None
+                    new_cmd = {}
                     for tbl in tables:
                         for rec in tbl.records:
                             ts = rec.get_time()
-                            cmd[rec.get_field()] = rec.get_value()
+                            new_cmd[rec.get_field()] = rec.get_value()
 
-                    if ts and ts != last_ts:
-                        last_ts = ts
-                        self.log_msg.emit("New Command Received")
-                        for nid, val in cmd.items():
-                            target_id = self.allowed_setpoints_map.get(nid, nid)
-                            if target_id in self.valid_node_ids:
-                                node = client.get_node(target_id)
-                                await node.write_value(float(val))
-                                self.log_msg.emit(f"--> PLC WROTE: {target_id} = {val}")
-                except Exception:
-                    pass
+                    if new_cmd:
+                        if new_cmd != last_cmd:
+                            self.log_msg.emit(f"New Command from kiln2: {new_cmd}")
+                        last_cmd = new_cmd
+
+                except Exception as e:
+                    self.log_msg.emit(f"Query Error: {e}")
+
+                # Re-assert ALL last known setpoints every cycle
+                # (prevents simulation engines from resetting values)
+                for field_name, val in last_cmd.items():
+                    target_id = self.allowed_setpoints_map.get(field_name, field_name)
+                    if target_id in self.valid_node_ids:
+                        try:
+                            node = client.get_node(target_id)
+                            await node.write_value(ua.DataValue(ua.Variant(float(val), ua.VariantType.Double)))
+                            self.log_msg.emit(f"--> WROTE: {target_id} = {val}")
+                        except Exception as e:
+                            self.log_msg.emit(f"Write Error {target_id}: {e}")
+
                 await asyncio.sleep(2)
         except Exception as e:
             self.log_msg.emit(f"Watcher Error: {e}")
