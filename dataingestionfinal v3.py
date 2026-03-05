@@ -68,7 +68,7 @@ async def setup_opc_security(client, opc_config):
     if password: client.set_password(password)
 
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION ---U
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".opc_influx_client_selections.json")
 ICON_FILE = 'app_icon.ico'
 
