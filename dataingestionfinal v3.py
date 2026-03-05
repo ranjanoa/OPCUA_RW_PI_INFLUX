@@ -301,14 +301,15 @@ class OPCInfluxWorker(QThread):
 class SetpointWatcherWorker(QThread):
     log_msg = pyqtSignal(str)
 
-    def __init__(self, opc_config, allowed_setpoints_map):
+    def __init__(self, opc_config, influx_config, allowed_setpoints_map):
         super().__init__()
         self.opc_config = opc_config
+        self.influx_config = influx_config
         self.allowed_setpoints_map = allowed_setpoints_map
         self.valid_node_ids = set(allowed_setpoints_map.values())
         self.running = True
-        self.influx_bucket = getattr(config, 'DB_BUCKET', 'kiln_process_data')
-        self.write_back_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2')
+        self.influx_bucket = influx_config.get('bucket', 'kiln_process_data')
+        self.write_back_meas = 'kiln2'
 
     def stop(self):
         self.running = False
@@ -316,7 +317,11 @@ class SetpointWatcherWorker(QThread):
     async def run_loop(self):
         client = Client(url=self.opc_config['url'])
         await setup_opc_security(client, self.opc_config)
-        influx = InfluxDBClient(url=config.DB_URL, token=config.DB_TOKEN, org=config.DB_ORG)
+        influx = InfluxDBClient(
+            url=self.influx_config['url'],
+            token=self.influx_config['token'],
+            org=self.influx_config['org']
+        )
         query_api = influx.query_api()
 
         try:
@@ -1373,7 +1378,13 @@ class MainWindow(QMainWindow):
         if checked:
             if not self.model_setpoints: return self.watcher_chk.setChecked(False)
             conf = self._get_opc_config()
-            self.watcher_worker = SetpointWatcherWorker(conf, self.model_setpoints)
+            influx_conf = {
+                'url': self.influx_url_input.text(),
+                'token': self.influx_token_input.text(),
+                'org': self.influx_org_input.text(),
+                'bucket': self.influx_bucket_input.text()
+            }
+            self.watcher_worker = SetpointWatcherWorker(conf, influx_conf, self.model_setpoints)
             self.watcher_worker.log_msg.connect(self.log_widget.appendPlainText)
             self.watcher_worker.start()
             self.watcher_status.setText("Status: Running")
