@@ -869,7 +869,7 @@ class MainWindow(QMainWindow):
         g4 = QGroupBox("4. Automated Model Write-Back")
         v4 = QVBoxLayout()
         self.watcher_chk = QCheckBox("Enable Automated Write-Back")
-        self.watcher_chk.setEnabled(False)
+        self.watcher_chk.setEnabled(True)
         self.watcher_chk.toggled.connect(self.toggle_write_watcher)
         v4.addWidget(self.watcher_chk)
         self.watcher_status = QLabel("Status: Stopped")
@@ -1550,6 +1550,115 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyleSheet("""
+        QWidget {
+            background-color: #1e1e2e;
+            color: #cdd6f4;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 13px;
+        }
+        QGroupBox {
+            border: 1px solid #45475a;
+            border-radius: 6px;
+            margin-top: 10px;
+            padding-top: 6px;
+            font-weight: bold;
+            color: #89b4fa;
+            font-size: 13px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 8px;
+            padding: 0 4px;
+        }
+        QPushButton {
+            background-color: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 5px;
+            padding: 5px 12px;
+            font-size: 13px;
+        }
+        QPushButton:hover {
+            background-color: #45475a;
+            border: 1px solid #89b4fa;
+        }
+        QPushButton:pressed {
+            background-color: #585b70;
+        }
+        QPushButton:disabled {
+            background-color: #1e1e2e;
+            color: #6c7086;
+            border: 1px solid #313244;
+        }
+        QLineEdit, QSpinBox, QComboBox {
+            background-color: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 4px;
+            padding: 4px 6px;
+            font-size: 13px;
+        }
+        QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+            border: 1px solid #89b4fa;
+        }
+        QCheckBox, QRadioButton {
+            color: #cdd6f4;
+            font-size: 13px;
+            spacing: 6px;
+        }
+        QCheckBox::indicator, QRadioButton::indicator {
+            width: 16px;
+            height: 16px;
+        }
+        QCheckBox:disabled {
+            color: #6c7086;
+        }
+        QTreeWidget {
+            background-color: #181825;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            alternate-background-color: #1e1e2e;
+            font-size: 13px;
+        }
+        QTreeWidget::item:selected {
+            background-color: #89b4fa;
+            color: #1e1e2e;
+        }
+        QHeaderView::section {
+            background-color: #313244;
+            color: #89b4fa;
+            border: 1px solid #45475a;
+            padding: 4px;
+            font-weight: bold;
+        }
+        QPlainTextEdit {
+            background-color: #181825;
+            color: #a6e3a1;
+            border: 1px solid #45475a;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 12px;
+        }
+        QLabel {
+            color: #cdd6f4;
+            font-size: 13px;
+        }
+        QScrollBar:vertical {
+            background: #1e1e2e;
+            width: 10px;
+        }
+        QScrollBar::handle:vertical {
+            background: #45475a;
+            border-radius: 5px;
+        }
+        QSplitter::handle {
+            background: #45475a;
+        }
+        QStatusBar {
+            background-color: #181825;
+            color: #a6e3a1;
+        }
+    """)
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
     w = MainWindow()
