@@ -1464,7 +1464,6 @@ class MainWindow(QMainWindow):
                 val_str = str(value)
             item.setText(3, val_str)
 
-    @pyqtSlot(object, int)
     def _on_tag_name_changed(self, item, column):
         """Called when user double-clicks and edits a tag name cell."""
         if column != 0:
