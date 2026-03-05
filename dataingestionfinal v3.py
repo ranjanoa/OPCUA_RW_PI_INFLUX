@@ -363,7 +363,7 @@ class SetpointWatcherWorker(QThread):
                         except Exception as e:
                             self.log_msg.emit(f"Write Error {target_id}: {e}")
 
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
         except Exception as e:
             self.log_msg.emit(f"Watcher Error: {e}")
         finally:
