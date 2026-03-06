@@ -1431,6 +1431,30 @@ class MainWindow(QMainWindow):
             self._save_selections()
             self.status_bar.showMessage(f"Manually added WebID: {web_id}", 3000)
 
+    def _import_pi_tags_from_csv(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Import PI Tags CSV", "", "CSV (*.csv)")
+        if f:
+            try:
+                with open(f, 'r') as file:
+                    reader = csv.reader(file)
+                    added_count = 0
+                    existing_ids = {t['webId'] for t in self.pi_tags}
+                    for row in reader:
+                        # Expecting: WebID, Name, Alias (optional)
+                        if len(row) >= 1:
+                            web_id = row[0].strip()
+                            if web_id and web_id not in existing_ids:
+                                name = row[1].strip() if len(row) > 1 and row[1].strip() else "Imported_Tag"
+                                alias = row[2].strip() if len(row) > 2 and row[2].strip() else name
+                                self.pi_tags.append({'name': name, 'webId': web_id, 'alias': alias})
+                                existing_ids.add(web_id)
+                                added_count += 1
+                self._refresh_pi_tags_tree()
+                self._save_selections()
+                QMessageBox.information(self, "Import Successful", f"Imported {added_count} new PI Tags.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error Interpreting CSV", f"Could not import CSV: {e}")
+
     def start_pi_gateway(self):
         if not self.pi_tags:
             return QMessageBox.warning(self, "No PI Tags", "Add PI tags first using Search.")
