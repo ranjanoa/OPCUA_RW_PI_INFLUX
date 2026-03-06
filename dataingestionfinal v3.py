@@ -1011,9 +1011,12 @@ class MainWindow(QMainWindow):
         h8a = QHBoxLayout()
         self.pi_search_button = QPushButton("🔍 Search PI Tags...")
         self.pi_search_button.clicked.connect(self._open_pi_search)
+        self.pi_manual_add_button = QPushButton("➕ Manual Add")
+        self.pi_manual_add_button.clicked.connect(self._manual_add_pi_tag)
         self.pi_clear_button = QPushButton("✕ Clear All")
         self.pi_clear_button.clicked.connect(self._clear_pi_tags)
         h8a.addWidget(self.pi_search_button)
+        h8a.addWidget(self.pi_manual_add_button)
         h8a.addWidget(self.pi_clear_button)
         f8.addRow(h8a)
 
@@ -1406,6 +1409,27 @@ class MainWindow(QMainWindow):
         self.pi_tags = []
         self._refresh_pi_tags_tree()
         self._save_selections()
+
+    def _manual_add_pi_tag(self):
+        from PyQt6.QtWidgets import QInputDialog
+        web_id, ok = QInputDialog.getText(self, "Manual Add PI Tag", "Enter the WebID for the PI Tag:")
+        if ok and web_id.strip():
+            web_id = web_id.strip()
+            existing_ids = {t['webId'] for t in self.pi_tags}
+            if web_id in existing_ids:
+                QMessageBox.information(self, "Info", "WebID already exists in the list.")
+                return
+            
+            alias, ok2 = QInputDialog.getText(self, "Manual Add PI Tag", "Enter an intuitive Alias/Name for this WebID:")
+            if ok2 and alias.strip():
+                name = alias.strip()
+            else:
+                name = "Manual_Tag"
+
+            self.pi_tags.append({'name': name, 'webId': web_id, 'alias': name})
+            self._refresh_pi_tags_tree()
+            self._save_selections()
+            self.status_bar.showMessage(f"Manually added WebID: {web_id}", 3000)
 
     def start_pi_gateway(self):
         if not self.pi_tags:
