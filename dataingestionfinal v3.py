@@ -7,6 +7,7 @@ import csv
 import time
 import re
 from datetime import datetime, timezone
+from collections import deque
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -232,6 +233,7 @@ class OPCInfluxWorker(QThread):
         self.interval_ms = interval_ms
         self._is_running = True
         self.db_measurement = 'kiln1'
+        self.value_history = {}  # {nodeId: deque(maxlen=5)}
 
     def stop(self):
         self._is_running = False
@@ -270,6 +272,23 @@ class OPCInfluxWorker(QThread):
                                 final_val = float(val)
                         except (ValueError, TypeError):
                             final_val = str(val)
+
+                        # Moving Average Filter to mask simulator drops to zero
+                        if isinstance(final_val, float):
+                            # Initialize queue if not present
+                            if nid not in self.value_history:
+                                self.value_history[nid] = deque(maxlen=5)
+
+                            # If value drops exactly to 0 but we have recent history that wasn't 0
+                            # Assume it's a spurious drop and substitute the moving average
+                            if final_val == 0.0 and len(self.value_history[nid]) > 0:
+                                avg = sum(self.value_history[nid]) / len(self.value_history[nid])
+                                # Only mask if the average is significantly non-zero
+                                if abs(avg) > 0.01:
+                                    final_val = avg
+                            else:
+                                # Normal case: add the valid value to history
+                                self.value_history[nid].append(final_val)
 
                         point.field(tag_name, final_val)  # <-- tag name, not NodeID
 
@@ -331,6 +350,19 @@ class SetpointWatcherWorker(QThread):
             await asyncio.wait_for(client.connect(), timeout=10.0)
             self.log_msg.emit(f"Watcher Active on '{self.write_back_meas}'")
             last_cmd = {}  # holds last known setpoints to continuously re-assert
+            last_logged_writes = {} # tracks actual state pushed to OPC server
+            
+            # Cache nodes and their VariantTypes to prevent asyncua from re-requesting on every loop tick
+            cached_nodes = {}
+            cached_types = {}
+            for nid in self.valid_node_ids:
+                try:
+                    nd = client.get_node(nid)
+                    cached_nodes[nid] = nd
+                    # Fetch and store exact datatype once at startup!
+                    cached_types[nid] = await nd.read_data_type_as_variant_type()
+                except Exception:
+                    pass
 
             while self.running:
                 q = f'from(bucket:"{self.influx_bucket}") |> range(start: -1m) |> filter(fn: (r) => r["_measurement"] == "{self.write_back_meas}") |> last()'
@@ -347,7 +379,7 @@ class SetpointWatcherWorker(QThread):
                     if new_cmd:
                         # Only log if there's actually a new or changed value
                         if any(last_cmd.get(k) != v for k, v in new_cmd.items()):
-                            self.log_msg.emit(f"New Command from kiln2: {new_cmd}")
+                            self.log_msg.emit(f"New Command from {self.write_back_meas}: {new_cmd}")
                         # Update the persistent dictionary instead of replacing it,
                         # so that tags older than 1m aren't forgotten and reset to 0
                         last_cmd.update(new_cmd)
@@ -358,21 +390,30 @@ class SetpointWatcherWorker(QThread):
                     await asyncio.sleep(1)
 
                 # Re-assert ALL last known setpoints every cycle
-                # (prevents simulation engines from resetting values)
+                # (prevents simulation engines from resetting values automatically)
                 for field_name, val in last_cmd.items():
                     target_id = self.allowed_setpoints_map.get(field_name, field_name)
-                    if target_id in self.valid_node_ids:
+                    if target_id in self.valid_node_ids and target_id in cached_nodes:
                         try:
-                            # Protect against indefinite hangs if OPC server drops connection silently
-                            node = client.get_node(target_id)
-                            # Use auto-inference (float) instead of strict Double to match node's actual datatype
+                            node = cached_nodes[target_id]
+                            vtype = cached_types.get(target_id, ua.VariantType.Double)
+                            
+                            # Build exact variant. Bypasses asyncua background type queries.
+                            dv = ua.DataValue(ua.Variant(float(val), vtype))
+                            
                             await asyncio.wait_for(
-                                node.write_value(float(val)),
+                                node.write_value(dv),
                                 timeout=5.0
                             )
-                            self.log_msg.emit(f"--> WROTE: {target_id} = {val}")
+                            # Only log to UI if the value has actually changed, to avoid spam
+                            if last_logged_writes.get(target_id) != val:
+                                self.log_msg.emit(f"--> WROTE: {target_id} = {val}")
+                                last_logged_writes[target_id] = val
                         except Exception as e:
-                            self.log_msg.emit(f"Write Error {target_id}: {e}")
+                            # Only log error if different than before to avoid spam
+                            if last_logged_writes.get(target_id) != "ERROR":
+                                self.log_msg.emit(f"Write Error {target_id}: {e}")
+                                last_logged_writes[target_id] = "ERROR"
 
                 await asyncio.sleep(0.5)
         except Exception as e:
@@ -1165,26 +1206,49 @@ class MainWindow(QMainWindow):
             from cryptography.hazmat.primitives import serialization, hashes
             from cryptography import x509
             from cryptography.x509.oid import NameOID
-            from datetime import timedelta
+            from cryptography.x509.general_name import DNSName, IPAddress, UniformResourceIdentifier
+            import datetime
+            import ipaddress
             
             self.cert_folder.mkdir(exist_ok=True)
             private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            
             subject = issuer = x509.Name([
-                x509.NameAttribute(NameOID.COMMON_NAME, u"PyQt6 OPC UA Client"),
+                x509.NameAttribute(NameOID.COUNTRY_NAME, u"IN"),
+                x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"HE"),
+                x509.NameAttribute(NameOID.LOCALITY_NAME, u"HE"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"IN"),
+                x509.NameAttribute(NameOID.COMMON_NAME, u"CIMPOR OPC CLIENT UA"),
             ])
-            cert = x509.CertificateBuilder().subject_name(
-                subject
-            ).issuer_name(
-                issuer
-            ).public_key(
-                private_key.public_key()
-            ).serial_number(
-                x509.random_serial_number()
-            ).not_valid_before(
-                datetime.utcnow()
-            ).not_valid_after(
-                datetime.utcnow() + timedelta(days=3650)
-            ).sign(private_key, hashes.SHA256())
+
+            valid_from = datetime.datetime.now(datetime.timezone.utc)
+            valid_to = valid_from + datetime.timedelta(days=365)
+
+            alt_names = x509.SubjectAlternativeName([
+                UniformResourceIdentifier("urn:freeopcua:client"),
+                DNSName("PTLXAIPYROCPS01"),
+                IPAddress(ipaddress.IPv4Address("10.1.250.1")),
+            ])
+
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(issuer)
+                .public_key(private_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(valid_from)
+                .not_valid_after(valid_to)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(alt_names, critical=False)
+                .add_extension(
+                    x509.ExtendedKeyUsage([
+                        x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+                        x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
+                    ]),
+                    critical=False,
+                )
+                .sign(private_key, hashes.SHA256())
+            )
             
             with open(self.client_cert_path, "wb") as f:
                 f.write(cert.public_bytes(serialization.Encoding.DER))
@@ -1192,7 +1256,7 @@ class MainWindow(QMainWindow):
             with open(self.client_key_path, "wb") as f:
                 f.write(private_key.private_bytes(
                     encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    format=serialization.PrivateFormat.PKCS8,
                     encryption_algorithm=serialization.NoEncryption()
                 ))
                 
