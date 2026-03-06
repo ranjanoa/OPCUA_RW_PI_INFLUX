@@ -676,38 +676,67 @@ class PIInfluxWorker(QThread):
             web_ids = [t['webId'] for t in self.pi_tags]
             alias_map = {t['webId']: t.get('alias') or t['name'] for t in self.pi_tags}
 
+            # Detect mode: stream_url or classic WebID batch
+            use_stream_url_mode = any(t.get('stream_url') or t['webId'].startswith('http') for t in self.pi_tags)
+
             while self._is_running:
                 try:
-                    # Batch value request
-                    batch_url = f"{self.pi_url}/streamsets/value"
-                    payload = [{'WebId': wid} for wid in web_ids]
-                    resp = requests.post(
-                        batch_url,
-                        json=payload,
-                        auth=(self.pi_user, self.pi_password),
-                        verify=False,
-                        timeout=10
-                    )
-                    resp.raise_for_status()
-                    items = resp.json().get('Items', [])
-
                     ts = datetime.now(timezone.utc)
                     point = Point(self.db_measurement).time(ts, WritePrecision.NS)
                     log_samples = []
 
-                    for item in items:
-                        wid = item.get('WebId', '')
-                        val_obj = item.get('Value', {})
-                        raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
-                        alias = alias_map.get(wid, wid)
-                        try:
-                            val = float(raw)
-                        except (ValueError, TypeError):
-                            val = str(raw)
-                        point.field(alias, val)
-                        self.live_data_update.emit(wid, val)
-                        if len(log_samples) < 3:
-                            log_samples.append(f"{alias}={val}")
+                    if use_stream_url_mode:
+                        # Call each stream URL individually: GET {url}
+                        for t in self.pi_tags:
+                            stream_url = t.get('stream_url') or t['webId']
+                            alias = alias_map.get(t['webId'], t.get('alias', t['name']))
+                            try:
+                                resp = requests.get(
+                                    stream_url,
+                                    auth=(self.pi_user, self.pi_password),
+                                    verify=False,
+                                    timeout=10
+                                )
+                                resp.raise_for_status()
+                                data = resp.json()
+                                val_obj = data.get('Value', data)
+                                raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
+                                try:
+                                    val = float(raw)
+                                except (ValueError, TypeError):
+                                    val = str(raw)
+                                point.field(alias, val)
+                                self.live_data_update.emit(t['webId'], val)
+                                if len(log_samples) < 3:
+                                    log_samples.append(f"{alias}={val}")
+                            except Exception as e:
+                                self.log_message.emit(f"PI Stream Error [{alias}]: {e}")
+                    else:
+                        # Classic batch mode using /streamsets/value
+                        batch_url = f"{self.pi_url}/streamsets/value"
+                        payload = [{'WebId': wid} for wid in web_ids]
+                        resp = requests.post(
+                            batch_url,
+                            json=payload,
+                            auth=(self.pi_user, self.pi_password),
+                            verify=False,
+                            timeout=10
+                        )
+                        resp.raise_for_status()
+                        items = resp.json().get('Items', [])
+                        for item in items:
+                            wid = item.get('WebId', '')
+                            val_obj = item.get('Value', {})
+                            raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
+                            alias = alias_map.get(wid, wid)
+                            try:
+                                val = float(raw)
+                            except (ValueError, TypeError):
+                                val = str(raw)
+                            point.field(alias, val)
+                            self.live_data_update.emit(wid, val)
+                            if len(log_samples) < 3:
+                                log_samples.append(f"{alias}={val}")
 
                     write_api.write(
                         bucket=self.influx_config['bucket'],
@@ -1013,10 +1042,16 @@ class MainWindow(QMainWindow):
         self.pi_search_button.clicked.connect(self._open_pi_search)
         self.pi_manual_add_button = QPushButton("➕ Manual Add")
         self.pi_manual_add_button.clicked.connect(self._manual_add_pi_tag)
+        self.pi_paste_urls_button = QPushButton("📋 Paste Stream URLs")
+        self.pi_paste_urls_button.clicked.connect(self._paste_pi_stream_urls)
+        self.pi_import_csv_button = QPushButton("📂 Import CSV")
+        self.pi_import_csv_button.clicked.connect(self._import_pi_tags_from_csv)
         self.pi_clear_button = QPushButton("✕ Clear All")
         self.pi_clear_button.clicked.connect(self._clear_pi_tags)
         h8a.addWidget(self.pi_search_button)
         h8a.addWidget(self.pi_manual_add_button)
+        h8a.addWidget(self.pi_paste_urls_button)
+        h8a.addWidget(self.pi_import_csv_button)
         h8a.addWidget(self.pi_clear_button)
         f8.addRow(h8a)
 
@@ -1431,6 +1466,58 @@ class MainWindow(QMainWindow):
             self._save_selections()
             self.status_bar.showMessage(f"Manually added WebID: {web_id}", 3000)
 
+    def _paste_pi_stream_urls(self):
+        """Parse full PI Web API stream URLs and extract WebIDs automatically."""
+        from PyQt6.QtWidgets import QDialog, QTextEdit, QDialogButtonBox, QVBoxLayout, QLabel
+        import re
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Paste PI Web API Stream URLs")
+        dlg.setMinimumSize(700, 400)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(
+            "Paste your PI Web API stream URLs below, one per line.\n"
+            "Format: https://server/piwebapi/streams/{WebID}/value\n"
+            "The WebID will be extracted automatically."
+        ))
+        text_edit = QTextEdit()
+        text_edit.setPlaceholderText("https://server/piwebapi/streams/F1Ab.../value")
+        layout.addWidget(text_edit)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        raw_text = text_edit.toPlainText()
+        # Match the URL pattern and extract WebID
+        pattern = re.compile(r'https?://[^/]+/piwebapi/streams/([^/]+)/value', re.IGNORECASE)
+        existing_ids = {t['webId'] for t in self.pi_tags}
+        added_count = 0
+        for line in raw_text.splitlines():
+            line = line.strip().lstrip(',').strip()
+            if not line:
+                continue
+            m = pattern.search(line)
+            if m:
+                web_id = m.group(1)
+                full_url = line  # store full URL so worker can call it directly
+                if web_id not in existing_ids:
+                    # Derive readable name from path after the last backslash
+                    path_part = re.sub(r'%[0-9A-Fa-f]{2}', '', web_id)  # remove URL encoding remnants
+                    name = f"PI_Tag_{added_count + 1}"
+                    # Store the full stream URL as webId so the worker can call it directly
+                    self.pi_tags.append({'name': name, 'webId': full_url, 'alias': name, 'stream_url': full_url})
+                    existing_ids.add(web_id)
+                    added_count += 1
+
+        if added_count == 0:
+            QMessageBox.warning(self, "No URLs Found", "No valid PI stream URLs were detected. Make sure URLs contain '/piwebapi/streams/{WebID}/value'.")
+        else:
+            self._refresh_pi_tags_tree()
+            self._save_selections()
+            QMessageBox.information(self, "URLs Imported", f"Added {added_count} PI tags from stream URLs.\n\nDouble-click the Alias column to rename each tag.")
+
     def _import_pi_tags_from_csv(self):
         f, _ = QFileDialog.getOpenFileName(self, "Import PI Tags CSV", "", "CSV (*.csv)")
         if f:
@@ -1440,7 +1527,7 @@ class MainWindow(QMainWindow):
                     added_count = 0
                     existing_ids = {t['webId'] for t in self.pi_tags}
                     for row in reader:
-                        # Expecting: WebID, Name, Alias (optional)
+                        # Expecting: WebID/StreamURL, Name, Alias (optional)
                         if len(row) >= 1:
                             web_id = row[0].strip()
                             if web_id and web_id not in existing_ids:
