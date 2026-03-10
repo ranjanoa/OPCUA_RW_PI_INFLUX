@@ -646,7 +646,7 @@ class PIInfluxWorker(QThread):
     live_data_update = pyqtSignal(str, object)   # webId, value
     worker_finished = pyqtSignal()
 
-    def __init__(self, pi_url, pi_user, pi_password, influx_config, pi_tags, interval_sec):
+    def __init__(self, pi_url, pi_user, pi_password, influx_config, pi_tags, interval_sec, use_api_key=False, pi_api_key=""):
         super().__init__()
         self.pi_url = pi_url.rstrip('/')
         self.pi_user = pi_user
@@ -655,6 +655,8 @@ class PIInfluxWorker(QThread):
         # pi_tags: list of {webId, name, alias}
         self.pi_tags = pi_tags
         self.interval_sec = interval_sec
+        self.use_api_key = use_api_key
+        self.pi_api_key = pi_api_key
         self._is_running = True
         self.db_measurement = getattr(config, 'DB_MEASUREMENT', 'kiln1') if config else 'kiln1'
 
@@ -691,14 +693,16 @@ class PIInfluxWorker(QThread):
                             stream_url = t.get('stream_url') or t['webId']
                             alias = alias_map.get(t['webId'], t.get('alias', t['name']))
                             try:
+                                auth = None if self.use_api_key else (self.pi_user, self.pi_password)
                                 resp = requests.get(
                                     stream_url,
-                                    auth=(self.pi_user, self.pi_password),
+                                    auth=auth,
                                     verify=False,
                                     timeout=10
                                 )
                                 resp.raise_for_status()
                                 data = resp.json()
+                                # Handle user's new format where Value might be at top level or nested
                                 val_obj = data.get('Value', data)
                                 raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
                                 try:
@@ -715,10 +719,11 @@ class PIInfluxWorker(QThread):
                         # Classic batch mode using /streamsets/value
                         batch_url = f"{self.pi_url}/streamsets/value"
                         payload = [{'WebId': wid} for wid in web_ids]
+                        auth = None if self.use_api_key else (self.pi_user, self.pi_password)
                         resp = requests.post(
                             batch_url,
                             json=payload,
-                            auth=(self.pi_user, self.pi_password),
+                            auth=auth,
                             verify=False,
                             timeout=10
                         )
@@ -829,6 +834,8 @@ class MainWindow(QMainWindow):
         self.selections["pi_url"] = self.pi_url_input.text()
         self.selections["pi_username"] = self.pi_username_input.text()
         self.selections["pi_password"] = self.pi_password_input.text()
+        self.selections["use_pi_api_key"] = self.pi_use_api_key_chk.isChecked()
+        self.selections["pi_api_key"] = self.pi_api_key_input.text()
         self.selections["pi_tags"] = self.pi_tags
         try:
             with open(CONFIG_FILE, 'w') as f:
@@ -1033,9 +1040,17 @@ class MainWindow(QMainWindow):
         self.pi_username_input = QLineEdit(self.selections.get("pi_username", ""))
         self.pi_password_input = QLineEdit(self.selections.get("pi_password", ""))
         self.pi_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pi_api_key_input = QLineEdit(self.selections.get("pi_api_key", ""))
+        self.pi_use_api_key_chk = QCheckBox("Use API Key")
+        self.pi_use_api_key_chk.setChecked(self.selections.get("use_pi_api_key", False))
+        self.pi_use_api_key_chk.toggled.connect(self._toggle_pi_auth_mode)
+
         f8.addRow("PI Web API URL:", self.pi_url_input)
+        f8.addRow(self.pi_use_api_key_chk)
+        f8.addRow("API Key:", self.pi_api_key_input)
         f8.addRow("Username:", self.pi_username_input)
         f8.addRow("Password:", self.pi_password_input)
+        self._toggle_pi_auth_mode() # Set initial state
 
         h8a = QHBoxLayout()
         self.pi_search_button = QPushButton("🔍 Search PI Tags...")
@@ -1046,12 +1061,15 @@ class MainWindow(QMainWindow):
         self.pi_paste_urls_button.clicked.connect(self._paste_pi_stream_urls)
         self.pi_import_csv_button = QPushButton("📂 Import CSV")
         self.pi_import_csv_button.clicked.connect(self._import_pi_tags_from_csv)
+        self.pi_export_template_button = QPushButton("📄 Export Template")
+        self.pi_export_template_button.clicked.connect(self._export_pi_tags_template)
         self.pi_clear_button = QPushButton("✕ Clear All")
         self.pi_clear_button.clicked.connect(self._clear_pi_tags)
         h8a.addWidget(self.pi_search_button)
         h8a.addWidget(self.pi_manual_add_button)
         h8a.addWidget(self.pi_paste_urls_button)
         h8a.addWidget(self.pi_import_csv_button)
+        h8a.addWidget(self.pi_export_template_button)
         h8a.addWidget(self.pi_clear_button)
         f8.addRow(h8a)
 
@@ -1393,6 +1411,12 @@ class MainWindow(QMainWindow):
         self.start_simulator_button.setEnabled(bool(self.csv_file_path))  # Unlock
 
     # --- PI GATEWAY METHODS ---
+    def _toggle_pi_auth_mode(self):
+        use_api = self.pi_use_api_key_chk.isChecked()
+        self.pi_api_key_input.setEnabled(use_api)
+        self.pi_username_input.setEnabled(not use_api)
+        self.pi_password_input.setEnabled(not use_api)
+
     def _open_pi_search(self):
         dlg = PITagSearchDialog(
             self.pi_url_input.text(),
@@ -1490,26 +1514,46 @@ class MainWindow(QMainWindow):
             return
 
         raw_text = text_edit.toPlainText()
-        # Match the URL pattern and extract WebID
-        pattern = re.compile(r'https?://[^/]+/piwebapi/streams/([^/]+)/value', re.IGNORECASE)
+        # Relaxed pattern to handle user's new format: http://.../API_KEY/SOU/data?path=...
+        # Also keeping the old stream pattern for compatibility
+        stream_pattern = re.compile(r'https?://[^/]+/piwebapi/streams/([^/]+)/value', re.IGNORECASE)
+        path_pattern = re.compile(r'https?://[^/]+/[^/]+/[^/]+/data\?path=(.+)', re.IGNORECASE)
+        
         existing_ids = {t['webId'] for t in self.pi_tags}
         added_count = 0
         for line in raw_text.splitlines():
             line = line.strip().lstrip(',').strip()
             if not line:
                 continue
-            m = pattern.search(line)
-            if m:
-                web_id = m.group(1)
-                full_url = line  # store full URL so worker can call it directly
-                if web_id not in existing_ids:
-                    # Derive readable name from path after the last backslash
-                    path_part = re.sub(r'%[0-9A-Fa-f]{2}', '', web_id)  # remove URL encoding remnants
+            
+            web_id = None
+            full_url = line
+            
+            m_stream = stream_pattern.search(line)
+            m_path = path_pattern.search(line)
+            
+            if m_stream:
+                web_id = m_stream.group(1)
+            elif m_path:
+                # Use the path parameter as a pseudo-WebID
+                web_id = m_path.group(1)
+            else:
+                # If it's a URL but doesn't match above, just use it as is if it looks like a URL
+                if line.startswith('http'):
+                    web_id = line
+            
+            if web_id and web_id not in existing_ids:
+                # Try to get a nicer name from path= or last part of URL
+                if m_path:
+                    # e.g. \\PTSOUPIAF01\Souselas\SOU\Coal Mill\Operation Data|Coal Mill 41 ON -> Coal Mill 41 ON
+                    name = web_id.split('|')[-1] if '|' in web_id else web_id.split('\\')[-1]
+                    name = requests.utils.unquote(name)
+                else:
                     name = f"PI_Tag_{added_count + 1}"
-                    # Store the full stream URL as webId so the worker can call it directly
-                    self.pi_tags.append({'name': name, 'webId': full_url, 'alias': name, 'stream_url': full_url})
-                    existing_ids.add(web_id)
-                    added_count += 1
+                
+                self.pi_tags.append({'name': name, 'webId': web_id, 'alias': name, 'stream_url': full_url})
+                existing_ids.add(web_id)
+                added_count += 1
 
         if added_count == 0:
             QMessageBox.warning(self, "No URLs Found", "No valid PI stream URLs were detected. Make sure URLs contain '/piwebapi/streams/{WebID}/value'.")
@@ -1520,27 +1564,88 @@ class MainWindow(QMainWindow):
 
     def _import_pi_tags_from_csv(self):
         f, _ = QFileDialog.getOpenFileName(self, "Import PI Tags CSV", "", "CSV (*.csv)")
+        if not f:
+            return
+            
+        try:
+            # Re-use the regex from pasting
+            stream_pattern = re.compile(r'https?://[^/]+/piwebapi/streams/([^/]+)/value', re.IGNORECASE)
+            path_pattern = re.compile(r'https?://[^/]+/[^/]+/[^/]+/data\?path=(.+)', re.IGNORECASE)
+            
+            with open(f, 'r', encoding='utf-8-sig') as file:
+                # Use Sniffer to detect dialtect and header
+                content = file.read(4096)
+                file.seek(0)
+                dialect = csv.Sniffer().sniff(content) if content else csv.excel
+                has_header = csv.Sniffer().has_header(content) if content else False
+                
+                reader = csv.reader(file, dialect)
+                if has_header:
+                    next(reader) # Skip header
+                
+                added_count = 0
+                existing_ids = {t['webId'] for t in self.pi_tags}
+                
+                for row in reader:
+                    # Expecting: URL/WebID, Alias (optional), Name (optional)
+                    if not row: continue
+                    raw_url = row[0].strip()
+                    if not raw_url: continue
+                    
+                    alias = row[1].strip() if len(row) > 1 and row[1].strip() else None
+                    name = row[2].strip() if len(row) > 2 and row[2].strip() else None
+                    
+                    web_id = None
+                    full_url = raw_url
+                    
+                    m_stream = stream_pattern.search(raw_url)
+                    m_path = path_pattern.search(raw_url)
+                    
+                    if m_stream:
+                        web_id = m_stream.group(1)
+                    elif m_path:
+                        web_id = m_path.group(1)
+                    else:
+                        web_id = raw_url # Fallback: assume it's a WebID or direct URL
+                    
+                    if web_id and web_id not in existing_ids:
+                        if not name:
+                            if m_path:
+                                name = web_id.split('|')[-1] if '|' in web_id else web_id.split('\\')[-1]
+                                name = requests.utils.unquote(name)
+                            else:
+                                name = f"Imported_{added_count + 1}"
+                        
+                        if not alias:
+                            alias = name
+                            
+                        self.pi_tags.append({
+                            'name': name, 
+                            'webId': web_id, 
+                            'alias': alias, 
+                            'stream_url': full_url if full_url.startswith('http') else None
+                        })
+                        existing_ids.add(web_id)
+                        added_count += 1
+                        
+            self._refresh_pi_tags_tree()
+            self._save_selections()
+            QMessageBox.information(self, "Import Successful", f"Imported {added_count} PI tags from CSV.")
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Failed to import CSV: {e}")
+
+    def _export_pi_tags_template(self):
+        f, _ = QFileDialog.getSaveFileName(self, "Export PI CSV Template", "pi_tags_template.csv", "CSV (*.csv)")
         if f:
             try:
-                with open(f, 'r') as file:
-                    reader = csv.reader(file)
-                    added_count = 0
-                    existing_ids = {t['webId'] for t in self.pi_tags}
-                    for row in reader:
-                        # Expecting: WebID/StreamURL, Name, Alias (optional)
-                        if len(row) >= 1:
-                            web_id = row[0].strip()
-                            if web_id and web_id not in existing_ids:
-                                name = row[1].strip() if len(row) > 1 and row[1].strip() else "Imported_Tag"
-                                alias = row[2].strip() if len(row) > 2 and row[2].strip() else name
-                                self.pi_tags.append({'name': name, 'webId': web_id, 'alias': alias})
-                                existing_ids.add(web_id)
-                                added_count += 1
-                self._refresh_pi_tags_tree()
-                self._save_selections()
-                QMessageBox.information(self, "Import Successful", f"Imported {added_count} new PI Tags.")
+                with open(f, 'w', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow(["URL or WebID", "Alias (Influx Field Name)", "Tag Name (Display)"])
+                    writer.writerow(["http://ptliswinapp01:7000/KEY/SOU/data?path=\\\\SERVER\\PATH|TAG", "My_Tag_Alias", "Coal Mill 41 ON"])
+                    writer.writerow(["https://server/piwebapi/streams/F1Abc.../value", "Another_Tag", "Temperature"])
+                QMessageBox.information(self, "Success", "Template exported. You can fill this CSV and use 'Import CSV' to bulk load tags.")
             except Exception as e:
-                QMessageBox.critical(self, "Error Interpreting CSV", f"Could not import CSV: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to export template: {e}")
 
     def start_pi_gateway(self):
         if not self.pi_tags:
@@ -1559,7 +1664,9 @@ class MainWindow(QMainWindow):
             pi_password=self.pi_password_input.text(),
             influx_config=conf,
             pi_tags=list(self.pi_tags),
-            interval_sec=self.pi_interval_spin.value()
+            interval_sec=self.pi_interval_spin.value(),
+            use_api_key=self.pi_use_api_key_chk.isChecked(),
+            pi_api_key=self.pi_api_key_input.text()
         )
         self.pi_worker.log_message.connect(self.log_widget.appendPlainText)
         self.pi_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
