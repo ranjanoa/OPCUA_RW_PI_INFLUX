@@ -710,7 +710,6 @@ class PIInfluxWorker(QThread):
                                     # Fallback for standard PI Web API formats
                                     val_obj = data.get('Value', data)
                                     raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
-Why this works:
                                 try:
                                     val = float(raw)
                                 except (ValueError, TypeError):
