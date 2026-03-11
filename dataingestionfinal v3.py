@@ -702,9 +702,15 @@ class PIInfluxWorker(QThread):
                                 )
                                 resp.raise_for_status()
                                 data = resp.json()
-                                # Handle user's new format where Value might be at top level or nested
-                                val_obj = data.get('Value', data)
-                                raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
+                                
+                                # Extract value from the specific {"data": [{"Value": X}]} structure
+                                if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+                                    raw = data["data"][0].get("Value", data)
+                                else:
+                                    # Fallback for standard PI Web API formats
+                                    val_obj = data.get('Value', data)
+                                    raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
+Why this works:
                                 try:
                                     val = float(raw)
                                 except (ValueError, TypeError):
