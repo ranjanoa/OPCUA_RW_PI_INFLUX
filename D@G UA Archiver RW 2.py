@@ -313,7 +313,8 @@ class OpcUaArchiverApp(tk.Tk):
         self.archiving_event.set()
         if self.client:
             try:
-                self.client.disconnect()  # Sync disconnect
+                # Use threadsafe to actually await the disconnect
+                self._run_async_threadsafe(self.client.disconnect())
             except:
                 pass
             self.client = None
@@ -369,6 +370,12 @@ class OpcUaArchiverApp(tk.Tk):
         item = self.tree.insert(parent_item, "end", text=text, values=(nodeid,))
         self.tree.insert(item, "end", text="loading...")
 
+    def _batch_add_nodes(self, parent_item, nodes_to_add):
+        """Helper to insert multiple nodes at once on the main thread"""
+        for text, nodeid in nodes_to_add:
+            item = self.tree.insert(parent_item, "end", text=text, values=(nodeid,))
+            self.tree.insert(item, "end", text="loading...")
+
 
     def on_tree_open(self, event):
         item = self.tree.focus()
@@ -382,14 +389,31 @@ class OpcUaArchiverApp(tk.Tk):
             nodeid = self.tree.item(item)["values"][0]
             
             async def load_subs():
-                node = self.client.get_node(nodeid)
-                subs = await node.get_children()
-                for sub in subs:
-                    sub_display = (await sub.read_display_name()).Text
-                    sub_nodeid = sub.nodeid.to_string()
-                    # Schedule UI update on main thread
-                    self.after(0, self._add_node_to_tree, item, sub_display, sub_nodeid)
-            
+                try:
+                    if not self.client: return
+                    node = self.client.get_node(nodeid)
+                    subs = await node.get_children()
+                    self.show_message(f"Found {len(subs)} children, reading names...")
+                    nodes_to_add = []
+                    for i, sub in enumerate(subs):
+                        try:
+                            if i % 20 == 0:
+                                self.show_message(f"Reading names: {i}/{len(subs)}")
+                            sub_display_obj = await sub.read_display_name()
+                            sub_display = sub_display_obj.Text if sub_display_obj else "Unknown"
+                            sub_nodeid = sub.nodeid.to_string()
+                            nodes_to_add.append((sub_display, sub_nodeid))
+                        except Exception:
+                            continue
+                    
+                    # Schedule batch UI update on main thread
+                    if nodes_to_add:
+                        self.after(0, self._batch_add_nodes, item, nodes_to_add)
+                    else:
+                        self.show_message(f"Folder '{self.tree.item(item)['text']}' is empty or inaccessible.")
+                except Exception as e:
+                    self.show_message(f"Load error: {e}")
+
             try:
                 self._run_async_non_blocking(load_subs())
             except Exception as e:
