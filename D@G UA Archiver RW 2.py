@@ -9,7 +9,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from cryptography.hazmat.backends import default_backend
 from asyncua import Client
-from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+from asyncua.crypto.security_policies import (
+    SecurityPolicyBasic128Rsa15,
+    SecurityPolicyBasic256,
+    SecurityPolicyBasic256Sha256
+)
 from asyncua import ua
 from concurrent.futures import ThreadPoolExecutor
 from cryptography import x509
@@ -241,27 +245,32 @@ class OpcUaArchiverApp(tk.Tk):
                     client = Client(self.entry_url.get())
                     client.application_name = "Data@Glance OPC UA Archiver"
                     
-                    try:
-                        # Try SignAndEncrypt first
-                        await client.set_security(
-                            SecurityPolicyBasic256Sha256, 
-                            certificate=str(self.client_cert_path), 
-                            private_key=str(self.client_key_path),
-                            mode=ua.MessageSecurityMode.SignAndEncrypt
-                        )
-                    except Exception as cert_err:
-                        self.show_message(f"Cert security SignAndEncrypt failed, trying Sign: {cert_err}")
-                        try:
-                            # Fallback to Sign only
-                            await client.set_security(
-                                SecurityPolicyBasic256Sha256, 
-                                certificate=str(self.client_cert_path),
-                                private_key=str(self.client_key_path),
-                                mode=ua.MessageSecurityMode.Sign
-                            )
-                        except Exception as sign_err:
-                            self.show_message(f"Cert security Sign also failed: {sign_err}")
-                            # Fallback to NoSecurity if allowed/needed, or just let connect fail
+                    policies = [
+                        SecurityPolicyBasic256Sha256,
+                        SecurityPolicyBasic256,
+                        SecurityPolicyBasic128Rsa15
+                    ]
+                    
+                    connected_with_security = False
+                    for policy in policies:
+                        for mode in [ua.MessageSecurityMode.SignAndEncrypt, ua.MessageSecurityMode.Sign]:
+                            try:
+                                await client.set_security(
+                                    policy,
+                                    certificate=str(self.client_cert_path),
+                                    private_key=str(self.client_key_path),
+                                    mode=mode
+                                )
+                                connected_with_security = True
+                                self.show_message(f"Security: {policy.__name__} ({mode.name})")
+                                break
+                            except Exception:
+                                continue
+                        if connected_with_security:
+                            break
+                    
+                    if not connected_with_security:
+                        self.show_message("Cert security failed, connecting without cert")
                     
                     username = self.entry_username.get()
                     password = self.entry_password.get()

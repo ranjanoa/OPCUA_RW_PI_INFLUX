@@ -23,7 +23,11 @@ from PyQt6.QtGui import QIcon, QColor, QAction
 
 # Import OPC UA and InfluxDB
 from asyncua import Client, ua
-from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+from asyncua.crypto.security_policies import (
+    SecurityPolicyBasic128Rsa15,
+    SecurityPolicyBasic256,
+    SecurityPolicyBasic256Sha256
+)
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
@@ -52,24 +56,33 @@ async def setup_opc_security(client, opc_config):
     use_cert = opc_config.get('use_cert_security', False)
 
     if use_cert and cert_path and key_path and os.path.exists(cert_path) and os.path.exists(key_path):
-        try:
-            await client.set_security(
-                SecurityPolicyBasic256Sha256,
-                certificate=cert_path,
-                private_key=key_path,
-                mode=ua.MessageSecurityMode.SignAndEncrypt
-            )
-        except Exception as e:
-            logging.warning(f"Cert security SignAndEncrypt failed, trying Sign: {e}")
-            try:
-                await client.set_security(
-                    SecurityPolicyBasic256Sha256,
-                    certificate=cert_path,
-                    private_key=key_path,
-                    mode=ua.MessageSecurityMode.Sign
-                )
-            except Exception as e2:
-                logging.warning(f"Cert security Sign also failed, connecting without cert: {e2}")
+        policies = [
+            SecurityPolicyBasic256Sha256,
+            SecurityPolicyBasic256,
+            SecurityPolicyBasic128Rsa15
+        ]
+        
+        connected_with_security = False
+        for policy in policies:
+            for mode in [ua.MessageSecurityMode.SignAndEncrypt, ua.MessageSecurityMode.Sign]:
+                try:
+                    await client.set_security(
+                        policy,
+                        certificate=cert_path,
+                        private_key=key_path,
+                        mode=mode
+                    )
+                    connected_with_security = True
+                    logging.info(f"Set security to {policy.__name__} in mode {mode.name}")
+                    break
+                except Exception as e:
+                    # Silently try next combination
+                    continue
+            if connected_with_security:
+                break
+        
+        if not connected_with_security:
+            logging.warning("All cert security policies failed, connecting without cert")
 
     if username: client.set_user(username)
     if password: client.set_password(password)
