@@ -122,7 +122,9 @@ class ConfigEditorDialog(QDialog):
         self.fields = {}
         self.config_map = {
             "DB_URL": "Influx URL", "DB_TOKEN": "Influx Token", "DB_ORG": "Organization",
-            "DB_BUCKET": "Bucket Name", "DB_MEASUREMENT": "Read Measurement",
+            "DB_BUCKET": "Bucket Name", 
+            "DB_MEASUREMENT_OPC": "OPC Measurement",
+            "DB_MEASUREMENT_PI": "PI Measurement",
             "DB_MEASUREMENT_SETPOINTS": "Write-Back Measurement"
         }
 
@@ -999,7 +1001,9 @@ class MainWindow(QMainWindow):
         self.disconnect_opc_button = QPushButton("🔌 Disconnect")
         self.disconnect_opc_button.clicked.connect(self.disconnect_opc_server)
         self.disconnect_opc_button.setEnabled(False)
-        self.opc_measurement_input = QLineEdit(self.selections.get("opc_measurement", "kiln1"))
+        # Use the global config if available, otherwise fallback to local selections
+        default_opc = getattr(config, "DB_MEASUREMENT_OPC", self.selections.get("opc_measurement", "kiln1_opc"))
+        self.opc_measurement_input = QLineEdit(default_opc)
         f1.addRow("Measurement:", self.opc_measurement_input)
         h1.addWidget(self.connect_opc_button)
         h1.addWidget(self.disconnect_opc_button)
@@ -1136,7 +1140,9 @@ class MainWindow(QMainWindow):
         self.pi_use_api_key_chk.toggled.connect(self._toggle_pi_auth_mode)
 
         f8.addRow("PI Web API URL:", self.pi_url_input)
-        self.pi_measurement_input = QLineEdit(self.selections.get("pi_measurement", "kiln1"))
+        # Use the global config if available, otherwise fallback to local selections
+        default_pi = getattr(config, "DB_MEASUREMENT_PI", self.selections.get("pi_measurement", "kiln1_pi"))
+        self.pi_measurement_input = QLineEdit(default_pi)
         f8.addRow("Measurement:", self.pi_measurement_input)
         f8.addRow(self.pi_use_api_key_chk)
         f8.addRow("API Key:", self.pi_api_key_input)
