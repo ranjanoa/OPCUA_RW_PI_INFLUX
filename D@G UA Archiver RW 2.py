@@ -241,18 +241,27 @@ class OpcUaArchiverApp(tk.Tk):
                     client = Client(self.entry_url.get())
                     client.application_name = "Data@Glance OPC UA Archiver"
                     
-                    # Add timeout and fallback security
-                    client.set_security_mode("SignAndEncrypt")  # Try lighter first
                     try:
+                        # Try SignAndEncrypt first
                         await client.set_security(
                             SecurityPolicyBasic256Sha256, 
                             certificate=str(self.client_cert_path), 
-                            private_key=str(self.client_key_path)
+                            private_key=str(self.client_key_path),
+                            mode=ua.MessageSecurityMode.SignAndEncrypt
                         )
                     except Exception as cert_err:
-                        self.show_message(f"Cert security failed, trying Sign: {cert_err}")
-                        # Fallback to Sign only
-                        await client.set_security(SecurityPolicyBasic256Sha256, certificate=str(self.client_cert_path))
+                        self.show_message(f"Cert security SignAndEncrypt failed, trying Sign: {cert_err}")
+                        try:
+                            # Fallback to Sign only
+                            await client.set_security(
+                                SecurityPolicyBasic256Sha256, 
+                                certificate=str(self.client_cert_path),
+                                private_key=str(self.client_key_path),
+                                mode=ua.MessageSecurityMode.Sign
+                            )
+                        except Exception as sign_err:
+                            self.show_message(f"Cert security Sign also failed: {sign_err}")
+                            # Fallback to NoSecurity if allowed/needed, or just let connect fail
                     
                     username = self.entry_username.get()
                     password = self.entry_password.get()
@@ -273,24 +282,6 @@ class OpcUaArchiverApp(tk.Tk):
                 self.after(0, lambda: self.btn_connect.config(state="normal"))
         
         self.btn_connect.config(state="disabled")
-        threading.Thread(target=thread_connect, daemon=True).start()
-
-        self.save_influx_config()
-        def thread_connect():
-                try:
-                    async def async_connect():
-                        client = Client(self.entry_url.get())
-                        client.application_name = "Data@Glance OPC UA Archiver"
-                        await client.set_security(SecurityPolicyBasic256Sha256, certificate=str(self.client_cert_path), private_key=str(self.client_key_path))
-                        if self.entry_username.get(): client.set_user(self.entry_username.get())
-                        if self.entry_password.get(): client.set_password(self.entry_password.get())
-                        await client.connect()
-                        return client
-                    self.client = self._run_async_threadsafe(async_connect())
-                    self.after(0, self.post_connection_setup)
-                except Exception as e:
-                    self.show_message(f"Connect failed: {e}")
-                    self.start_reconnect_loop()
         threading.Thread(target=thread_connect, daemon=True).start()
 
     def post_connection_setup(self):

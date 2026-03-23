@@ -56,12 +56,18 @@ async def setup_opc_security(client, opc_config):
             await client.set_security(
                 SecurityPolicyBasic256Sha256,
                 certificate=cert_path,
-                private_key=key_path
+                private_key=key_path,
+                mode=ua.MessageSecurityMode.SignAndEncrypt
             )
         except Exception as e:
             logging.warning(f"Cert security SignAndEncrypt failed, trying Sign: {e}")
             try:
-                await client.set_security(SecurityPolicyBasic256Sha256, certificate=cert_path)
+                await client.set_security(
+                    SecurityPolicyBasic256Sha256,
+                    certificate=cert_path,
+                    private_key=key_path,
+                    mode=ua.MessageSecurityMode.Sign
+                )
             except Exception as e2:
                 logging.warning(f"Cert security Sign also failed, connecting without cert: {e2}")
 
