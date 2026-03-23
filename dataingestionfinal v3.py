@@ -1909,28 +1909,54 @@ class MainWindow(QMainWindow):
         self._save_selections()
 
     def _import_tags_from_csv(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Import CSV", "", "CSV (*.csv)")
-        if f:
-            try:
-                with open(f, 'r') as file:
-                    reader = csv.reader(file)
-                    for row in reader:
-                        if len(row) >= 1: self.selected_opc_tags[row[0]] = row[1] if len(row) > 1 else row[0]
+        f, _ = QFileDialog.getOpenFileName(self, "Import OPC Tags CSV", "", "CSV (*.csv)")
+        if not f:
+            return
+        try:
+            with open(f, 'r', encoding='utf-8-sig') as file:
+                content = file.read(4096)
+                file.seek(0)
+                dialect = csv.Sniffer().sniff(content) if content else csv.excel
+                has_header = csv.Sniffer().has_header(content) if content else False
+                
+                reader = csv.reader(file, dialect)
+                if has_header:
+                    next(reader) # Skip header
+                
+                added_count = 0
+                for row in reader:
+                    if not row or len(row) < 1: continue
+                    nid = row[0].strip()
+                    name = row[1].strip() if len(row) > 1 and row[1].strip() else nid
+                    tag_type = row[2].strip() if len(row) > 2 else "Input"
+                    
+                    if nid:
+                        self.selected_opc_tags[nid] = name
+                        if tag_type.lower() == "output":
+                            self.output_tags.add(nid)
+                        else:
+                            if nid in self.output_tags: self.output_tags.remove(nid)
+                        added_count += 1
+                
                 self._update_selected_tags_list_widget()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+                self._save_selections()
+                self.status_bar.showMessage(f"✅ Imported {added_count} OPC tags.", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Failed to import CSV: {e}")
 
     def _export_tags_to_csv(self):
-        f, _ = QFileDialog.getSaveFileName(self, "Export CSV", "", "CSV (*.csv)")
+        f, _ = QFileDialog.getSaveFileName(self, "Export OPC Tags CSV", "opc_tags_export.csv", "CSV (*.csv)")
         if f:
             try:
                 with open(f, 'w', newline='') as file:
                     writer = csv.writer(file)
                     writer.writerow(["NodeID", "Name", "Type"])
                     for nid, name in self.selected_opc_tags.items():
-                        writer.writerow([nid, name, "Output" if nid in self.output_tags else "Input"])
+                        tag_type = "Output" if nid in self.output_tags else "Input"
+                        writer.writerow([nid, name, tag_type])
+                QMessageBox.information(self, "Success", f"Exported {len(self.selected_opc_tags)} tags.")
             except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+                QMessageBox.critical(self, "Export Error", f"Failed to export CSV: {e}")
 
     def _load_csv_file(self):
         f, _ = QFileDialog.getOpenFileName(self, "Load CSV", "", "CSV (*.csv)")
