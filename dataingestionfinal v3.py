@@ -179,6 +179,8 @@ class ServerBrowseDialog(QDialog):
         self.tree.setHeaderLabels(["Node Name", "NodeID", "Type", "Value"])
         self.tree.setColumnWidth(0, 300)
         self.layout.addWidget(self.tree)
+        self.tree.itemExpanded.connect(self.on_item_expanded)
+        self.client = None
 
         btn_layout = QHBoxLayout()
         self.select_button = QPushButton("Add Selected Tags")
@@ -191,35 +193,48 @@ class ServerBrowseDialog(QDialog):
         self.selected_node_ids = set()
 
     async def populate_tree(self, client, existing_selections_nodeids=None):
+        self.client = client
         self.tree.clear()
         self.selected_node_ids.clear()
         if existing_selections_nodeids:
             self.selected_node_ids.update(existing_selections_nodeids)
         try:
+            # Add Objects node
             root_node = client.get_objects_node()
-            root_item = QTreeWidgetItem(self.tree, ["Objects", "i=85", "", ""])
-            await self.add_children_to_tree(client, root_node, root_item)
-            root_item.setExpanded(True)
+            node_id = root_node.nodeid.to_string()
+            root_item = QTreeWidgetItem(self.tree, ["Objects", node_id, "Object", ""])
+            # Add dummy child
+            QTreeWidgetItem(root_item, ["loading..."])
+            root_item.setExpanded(False)
         except Exception as e:
             logging.error(f"Browser Error: {e}")
 
-    async def add_children_to_tree(self, client, parent_node, parent_item):
+    def on_item_expanded(self, item):
+        if item.childCount() == 1 and item.child(0).text(0) == "loading...":
+            item.removeChild(item.child(0))
+            node_id = item.text(1)
+            # Launch async task to load children
+            asyncio.create_task(self._add_children_to_tree(self.client, node_id, item))
+
+    async def _add_children_to_tree(self, client, node_id, parent_item):
         try:
+            parent_node = client.get_node(node_id)
             children = await parent_node.get_children()
             for child in children:
                 display_name = await child.read_display_name()
-                node_id = child.nodeid.to_string()
+                child_node_id = child.nodeid.to_string()
                 node_class = await child.read_node_class()
 
-                item = QTreeWidgetItem(parent_item, [display_name.Text, node_id, node_class.name, ""])
+                item = QTreeWidgetItem(parent_item, [display_name.Text, child_node_id, node_class.name, ""])
                 if node_class == ua.NodeClass.Variable:
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(0,
-                                       Qt.CheckState.Checked if node_id in self.selected_node_ids else Qt.CheckState.Unchecked)
+                                       Qt.CheckState.Checked if child_node_id in self.selected_node_ids else Qt.CheckState.Unchecked)
                 elif node_class == ua.NodeClass.Object:
-                    await self.add_children_to_tree(client, child, item)
-        except:
-            pass
+                    # Add dummy for lazy loading
+                    QTreeWidgetItem(item, ["loading..."])
+        except Exception as e:
+            logging.error(f"Error loading children for {node_id}: {e}")
 
     def _add_selected_tags(self):
         selected = {}
