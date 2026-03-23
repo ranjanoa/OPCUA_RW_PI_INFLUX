@@ -1,0 +1,1 @@
+{"url": "opc.tcp://innm5cg44629dm:57888/OpcExpert", "username": "", "password": "", "influx_token": "", "influx_org": "your-org", "influx_bucket": "opcua_data", "archive_interval": "1", "browse_path": "0:Objects"}

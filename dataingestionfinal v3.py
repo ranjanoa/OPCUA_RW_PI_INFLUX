@@ -181,6 +181,7 @@ class ServerBrowseDialog(QDialog):
         self.layout.addWidget(self.tree)
         self.tree.itemExpanded.connect(self.on_item_expanded)
         self.client = None
+        self.browse_path = ""
 
         btn_layout = QHBoxLayout()
         self.select_button = QPushButton("Add Selected Tags")
@@ -192,19 +193,32 @@ class ServerBrowseDialog(QDialog):
         self.layout.addLayout(btn_layout)
         self.selected_node_ids = set()
 
-    async def populate_tree(self, client, existing_selections_nodeids=None):
+    async def populate_tree(self, client, existing_selections_nodeids=None, browse_path=""):
         self.client = client
         self.tree.clear()
         self.selected_node_ids.clear()
+        self.browse_path = browse_path
         if existing_selections_nodeids:
             self.selected_node_ids.update(existing_selections_nodeids)
         try:
-            # Add Objects node
-            root_node = client.get_objects_node()
-            node_id = root_node.nodeid.to_string()
-            root_item = QTreeWidgetItem(self.tree, ["Objects", node_id, "Object", ""])
-            # Add dummy child
-            QTreeWidgetItem(root_item, ["loading..."])
+            target_node = client.get_objects_node()
+            if self.browse_path:
+                parts = [p.strip() for p in self.browse_path.split("/") if p.strip()]
+                for part in parts:
+                    try:
+                        target_node = await target_node.get_child([part])
+                    except:
+                        logging.warning(f"Browser: Path part '{part}' not found")
+                        break
+            
+            node_id = target_node.nodeid.to_string()
+            display = (await target_node.read_display_name()).Text
+            node_class = await target_node.read_node_class()
+            
+            root_item = QTreeWidgetItem(self.tree, [display, node_id, node_class.name, ""])
+            # Add dummy child if it's an object to allow expansion
+            if node_class == ua.NodeClass.Object:
+                QTreeWidgetItem(root_item, ["loading..."])
             root_item.setExpanded(False)
         except Exception as e:
             logging.error(f"Browser Error: {e}")
@@ -887,6 +901,7 @@ class MainWindow(QMainWindow):
         self.selections["use_pi_api_key"] = self.pi_use_api_key_chk.isChecked()
         self.selections["pi_api_key"] = self.pi_api_key_input.text()
         self.selections["pi_tags"] = self.pi_tags
+        self.selections["opc_browse_path"] = self.opc_browse_path_input.text()
         self.selections["write_interval"] = self.write_interval_spinbox.value() # Save interval
         try:
             with open(CONFIG_FILE, 'w') as f:
@@ -938,9 +953,11 @@ class MainWindow(QMainWindow):
         self.opc_username_input = QLineEdit(self.selections.get("opc_username", ""))
         self.opc_password_input = QLineEdit(self.selections.get("opc_password", ""))
         self.opc_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.opc_browse_path_input = QLineEdit(self.selections.get("opc_browse_path", "0:Objects"))
         f1.addRow("Endpoint:", self.opc_endpoint_input)
         f1.addRow("Username:", self.opc_username_input)
         f1.addRow("Password:", self.opc_password_input)
+        f1.addRow("Browse Path:", self.opc_browse_path_input)
         
         h_cert = QHBoxLayout()
         self.generate_cert_button = QPushButton("🔐 Generate Certs")
@@ -1395,7 +1412,7 @@ class MainWindow(QMainWindow):
             self._save_selections()
             dlg = ServerBrowseDialog(self)
             dlg.tags_selected.connect(self._on_tags_selected)
-            await dlg.populate_tree(self.opc_client, self.selected_opc_tags.keys())
+            await dlg.populate_tree(self.opc_client, self.selected_opc_tags.keys(), self.opc_browse_path_input.text())
             
             # Non-blocking async execution of the dialog
             # Create a future to wait for the dialog to close

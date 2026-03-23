@@ -141,7 +141,12 @@ class OpcUaArchiverApp(tk.Tk):
         self.btn_save_influx.grid(row=1, column=7, padx=5, pady=2)
 
         # Row 2: Controls
-        self.btn_load_tree = tk.Button(self, text="Load Browse Tree", command=self.load_tree_thread, state="disabled")
+        tk.Label(self, text="Browse Path:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        self.entry_browse_path = tk.Entry(self, width=40)
+        self.entry_browse_path.grid(row=2, column=1, columnspan=4, sticky="ew", padx=5, pady=2)
+        self.entry_browse_path.insert(0, "0:Objects")
+
+        self.btn_load_tree = tk.Button(self, text="Load & Jump to Path", command=self.load_tree_thread, state="disabled")
         self.btn_load_tree.grid(row=2, column=6, padx=5, pady=2)
 
         # Treeview
@@ -224,7 +229,8 @@ class OpcUaArchiverApp(tk.Tk):
             "influx_token": self.influx_token,
             "influx_org": self.influx_org,
             "influx_bucket": self.influx_bucket,
-            "archive_interval": self.entry_archive_interval.get()
+            "archive_interval": self.entry_archive_interval.get(),
+            "browse_path": self.entry_browse_path.get()
         }
 
     def load_config(self):
@@ -239,6 +245,7 @@ class OpcUaArchiverApp(tk.Tk):
                 self.entry_influx_org.delete(0, tk.END); self.entry_influx_org.insert(0, data.get("influx_org", "your-org"))
                 self.entry_influx_bucket.delete(0, tk.END); self.entry_influx_bucket.insert(0, data.get("influx_bucket", "opcua_data"))
                 self.entry_archive_interval.delete(0, tk.END); self.entry_archive_interval.insert(0, data.get("archive_interval", "1"))
+                self.entry_browse_path.delete(0, tk.END); self.entry_browse_path.insert(0, data.get("browse_path", "0:Objects"))
                 self.influx_token = data.get("influx_token", "")
                 self.show_message("Config loaded")
             except Exception as e:
@@ -350,20 +357,36 @@ class OpcUaArchiverApp(tk.Tk):
     def load_tree(self):
         if not self.client: return
         self.after(0, lambda: self.tree.delete(*self.tree.get_children()))
+        path_str = self.entry_browse_path.get().strip()
+        
         try:
             async def populate():
-                root = self.client.nodes.root
-                objects_node = await root.get_child(["0:Objects"])
-                display = (await objects_node.read_display_name()).Text
-                nodeid = objects_node.nodeid.to_string()
-                
-                # Insert top-level node safely
-                self.after(0, self._add_node_to_tree, "", display, nodeid)
+                try:
+                    target_node = self.client.nodes.root
+                    if path_str:
+                        # Try to navigate the path, e.g. "Objects/MyFolder"
+                        parts = [p.strip() for p in path_str.split("/") if p.strip()]
+                        for part in parts:
+                            try:
+                                target_node = await target_node.get_child([part])
+                            except:
+                                self.show_message(f"Path part '{part}' not found, stopping at current node.")
+                                break
+                    else:
+                        target_node = await self.client.nodes.root.get_child(["0:Objects"])
+
+                    display = (await target_node.read_display_name()).Text
+                    nodeid = target_node.nodeid.to_string()
+                    
+                    # Insert top-level node safely
+                    self.after(0, self._add_node_to_tree, "", display, nodeid)
+                    self.show_message(f"Jumped to path: {path_str or 'Objects'}")
+                except Exception as e:
+                    self.show_message(f"Navigation error: {e}")
                 
             self._run_async_threadsafe(populate())
-            self.show_message("Root loaded. Expand to browse.")
         except Exception as e:
-            self.show_message(f"Tree error: {e}")
+            self.show_message(f"Populate error: {e}")
 
     def _add_node_to_tree(self, parent_item, text, nodeid):
         """Helper to safely insert a node and a dummy child from the main thread"""
