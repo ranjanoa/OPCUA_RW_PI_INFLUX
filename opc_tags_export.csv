@@ -1,0 +1,10 @@
+NodeID,Name,Type
+ns=3;i=1009,Kiln.Burner.Coal_Flow_SP,Input
+ns=3;i=1010,Kiln.Burner.Coal_Flow_SP(2),Input
+ns=3;i=1011,Kiln.Burner.Coal_Flow_SP(3),Input
+ns=3;i=1012,Kiln.Burner.Coal_Flow_SP(4),Input
+ns=3;i=1014,Kiln.Burner.Coal_Flow_SP(6),Input
+ns=3;i=1016,Kiln.Burner.Coal_Flow_SP(8),Input
+ns=3;i=1018,Kiln.Burner.Coal_Flow_SP(10),Input
+ns=3;i=1020,Kiln.Burner.Coal_Flow_SP(11)(2),Input
+ns=6;s=MyLevel,MyLevel,Input

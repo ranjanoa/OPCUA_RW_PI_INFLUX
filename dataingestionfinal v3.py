@@ -270,13 +270,14 @@ class OPCInfluxWorker(QThread):
     data_written = pyqtSignal(str)
     live_data_update = pyqtSignal(str, object)  # UI Signal
 
-    def __init__(self, opc_config, influx_config, selected_tags, write_mode, interval_ms):
+    def __init__(self, opc_config, influx_config, selected_tags, write_mode, interval_ms, tag_metadata=None):
         super().__init__()
         self.opc_config = opc_config
         self.influx_config = influx_config
         # selected_tags: {nodeId: tagName}
         self.selected_tags = selected_tags
         self.selected_tags_nodeids = list(selected_tags.keys())
+        self.tag_metadata = tag_metadata or {}
         self.write_mode = write_mode
         self.interval_ms = interval_ms
         self._is_running = True
@@ -316,16 +317,27 @@ class OPCInfluxWorker(QThread):
                         for i, val in enumerate(values):
                             nid = self.selected_tags_nodeids[i]
                             tag_name = self.selected_tags.get(nid, nid)
+                            meta = self.tag_metadata.get(nid, {"type": "Float"})
+                            expected_type = meta.get("type", "Float")
 
+                            final_val = None
                             try:
-                                if isinstance(val, bool):
-                                    final_val = val
-                                else:
-                                    final_val = float(val)
+                                if expected_type == "String":
+                                    final_val = str(val)
+                                elif expected_type == "Bool":
+                                    final_val = bool(val)
+                                else: # Float
+                                    if isinstance(val, (int, float, bool)):
+                                        final_val = float(val)
+                                    else:
+                                        # Attempt conversion or skip
+                                        final_val = float(val)
                             except (ValueError, TypeError):
-                                final_val = str(val)
+                                # Skip field if type mismatch to prevent InfluxDB 422 errors
+                                logging.warning(f"Skipping {tag_name} due to type mismatch (Expected {expected_type}, Got {type(val)})")
+                                continue
 
-                            if isinstance(final_val, float):
+                            if expected_type == "Float":
                                 if nid not in self.value_history:
                                     self.value_history[nid] = deque(maxlen=5)
 
@@ -336,9 +348,10 @@ class OPCInfluxWorker(QThread):
                                 else:
                                     self.value_history[nid].append(final_val)
 
-                            point.field(tag_name, final_val)
-                            self.live_data_update.emit(nid, final_val)
-                            if i < 3: log_samples.append(f"{tag_name}={final_val}")
+                            if final_val is not None:
+                                point.field(tag_name, final_val)
+                                self.live_data_update.emit(nid, final_val)
+                                if len(log_samples) < 3: log_samples.append(f"{tag_name}={final_val}")
 
                         write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
                         self.data_written.emit(f"✅ Live: {', '.join(log_samples)}...")
@@ -770,12 +783,12 @@ class PIInfluxWorker(QThread):
                                     raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
                                 try:
                                     val = float(raw)
+                                    point.field(alias, val)
+                                    self.live_data_update.emit(t['webId'], val)
+                                    if len(log_samples) < 3: log_samples.append(f"{alias}={val}")
                                 except (ValueError, TypeError):
-                                    val = str(raw)
-                                point.field(alias, val)
-                                self.live_data_update.emit(t['webId'], val)
-                                if len(log_samples) < 3:
-                                    log_samples.append(f"{alias}={val}")
+                                    logging.warning(f"Skipping PI field {alias} due to non-numeric value: {raw}")
+                                    continue
                             except Exception as e:
                                 self.log_message.emit(f"PI Stream Error [{alias}]: {e}")
                     else:
@@ -799,12 +812,12 @@ class PIInfluxWorker(QThread):
                             alias = alias_map.get(wid, wid)
                             try:
                                 val = float(raw)
+                                point.field(alias, val)
+                                self.live_data_update.emit(wid, val)
+                                if len(log_samples) < 3: log_samples.append(f"{alias}={val}")
                             except (ValueError, TypeError):
-                                val = str(raw)
-                            point.field(alias, val)
-                            self.live_data_update.emit(wid, val)
-                            if len(log_samples) < 3:
-                                log_samples.append(f"{alias}={val}")
+                                logging.warning(f"Skipping PI field {alias} during batch write due to non-numeric value: {raw}")
+                                continue
 
                     write_api.write(
                         bucket=self.influx_config['bucket'],
@@ -847,6 +860,11 @@ class MainWindow(QMainWindow):
         self.selections = self._load_selections()
         self.selected_opc_tags = self.selections.get("selected_opc_tags", {})
         self.output_tags = set(self.selections.get("output_tags", []))
+        self.tag_metadata = self.selections.get("tag_metadata", {})
+        # Ensure all existing tags have a default type if missing
+        for nid in self.selected_opc_tags:
+            if nid not in self.tag_metadata:
+                self.tag_metadata[nid] = {"type": "Float"}
         self.model_setpoints = {}
         self.csv_file_path = self.selections.get("csv_file_path")
         self.tag_item_map = {}
@@ -893,6 +911,7 @@ class MainWindow(QMainWindow):
         self.selections["influx_bucket"] = self.influx_bucket_input.text()
         self.selections["selected_opc_tags"] = self.selected_opc_tags
         self.selections["output_tags"] = list(self.output_tags)
+        self.selections["tag_metadata"] = self.tag_metadata
         self.selections["csv_file_path"] = self.csv_file_path
         self.selections["pi_url"] = self.pi_url_input.text()
         self.selections["pi_username"] = self.pi_username_input.text()
@@ -1167,9 +1186,12 @@ class MainWindow(QMainWindow):
         g_tags = QGroupBox("OPC UA Tags to Monitor")
         l_tags = QVBoxLayout()
         self.selected_tags_tree = QTreeWidget()
-        self.selected_tags_tree.setHeaderLabels(["Tag Name (editable)", "NodeID", "Type", "Value"])
+        self.selected_tags_tree.setHeaderLabels(["Tag Name (editable)", "NodeID", "Mode", "Data Type", "Value"])
         self.selected_tags_tree.setColumnWidth(0, 220)
-        self.selected_tags_tree.setToolTip("Double-click Tag Name to rename it (used as InfluxDB field name)")
+        self.selected_tags_tree.setColumnWidth(2, 80)
+        self.selected_tags_tree.setColumnWidth(3, 100)
+        self.selected_tags_tree.setToolTip("Double-click Tag Name to rename. Click 'Mode' or 'Data Type' to toggle them.")
+        self.selected_tags_tree.itemClicked.connect(self._on_tag_item_clicked)
         self.selected_tags_tree.itemChanged.connect(self._on_tag_name_changed)
         l_tags.addWidget(self.selected_tags_tree)
 
@@ -1834,7 +1856,10 @@ class MainWindow(QMainWindow):
     # --- TAG LIST UTILS ---
     @pyqtSlot(dict)
     def _on_tags_selected(self, tags):
-        self.selected_opc_tags.update(tags)
+        for nid, name in tags.items():
+            self.selected_opc_tags[nid] = name
+            if nid not in self.tag_metadata:
+                self.tag_metadata[nid] = {"type": "Float"}
         self._update_selected_tags_list_widget()
         self._save_selections()
 
@@ -1843,15 +1868,40 @@ class MainWindow(QMainWindow):
         self.write_tag_combo.clear()
         self.tag_item_map.clear()
         for nid, name in self.selected_opc_tags.items():
-            type_str = "[OUTPUT]" if nid in self.output_tags else "[INPUT]"
-            item = QTreeWidgetItem([name, nid, type_str, "---"])
+            mode_str = "[OUTPUT]" if nid in self.output_tags else "[INPUT]"
+            meta = self.tag_metadata.get(nid, {"type": "Float"})
+            type_str = f"[{meta.get('type', 'Float')}]"
+            
+            item = QTreeWidgetItem([name, nid, mode_str, type_str, "---"])
             item.setData(1, Qt.ItemDataRole.UserRole, nid)
             # Allow Tag Name (col 0) to be edited inline by double-clicking
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            
+            # Use distinct colors for Mode and Type columns
+            item.setForeground(2, QColor("#61dafb"))
+            item.setForeground(3, QColor("#ffcc00"))
+            
             self.selected_tags_tree.addTopLevelItem(item)
             self.tag_item_map[nid] = item
             if nid in self.output_tags: self.write_tag_combo.addItem(f"{name} ({nid})", userData=nid)
         self._update_write_combo()
+
+    def _on_tag_item_clicked(self, item, column):
+        nid = item.data(1, Qt.ItemDataRole.UserRole)
+        if not nid: return
+        
+        if column == 2: # Toggle Mode
+            if nid in self.output_tags: self.output_tags.remove(nid)
+            else: self.output_tags.add(nid)
+            self._update_selected_tags_list_widget()
+            self._save_selections()
+        elif column == 3: # Cycle Type
+            types = ["Float", "String", "Bool"]
+            curr = self.tag_metadata.get(nid, {"type": "Float"}).get("type", "Float")
+            next_type = types[(types.index(curr) + 1) % len(types)]
+            self.tag_metadata[nid] = {"type": next_type}
+            self._update_selected_tags_list_widget()
+            self._save_selections()
 
     @pyqtSlot(str, object)
     def _on_live_data_update(self, nodeid, value):
@@ -1861,7 +1911,7 @@ class MainWindow(QMainWindow):
                 val_str = f"{value:.3f}"
             else:
                 val_str = str(value)
-            item.setText(3, val_str)
+            item.setText(4, val_str) # Value is now col 4
 
     def _on_tag_name_changed(self, item, column):
         """Called when user double-clicks and edits a tag name cell."""
@@ -1897,7 +1947,8 @@ class MainWindow(QMainWindow):
     def _remove_selected_tags(self):
         for item in self.selected_tags_tree.selectedItems():
             nid = item.data(1, Qt.ItemDataRole.UserRole)
-            del self.selected_opc_tags[nid]
+            if nid in self.selected_opc_tags: del self.selected_opc_tags[nid]
+            if nid in self.tag_metadata: del self.tag_metadata[nid]
             if nid in self.output_tags: self.output_tags.remove(nid)
         self._update_selected_tags_list_widget()
         self._save_selections()
@@ -1905,6 +1956,7 @@ class MainWindow(QMainWindow):
     def _clear_all_tags(self):
         self.selected_opc_tags = {}
         self.output_tags = set()
+        self.tag_metadata = {}
         self._update_selected_tags_list_widget()
         self._save_selections()
 
@@ -1928,11 +1980,13 @@ class MainWindow(QMainWindow):
                     if not row or len(row) < 1: continue
                     nid = row[0].strip()
                     name = row[1].strip() if len(row) > 1 and row[1].strip() else nid
-                    tag_type = row[2].strip() if len(row) > 2 else "Input"
+                    mode_str = row[2].strip() if len(row) > 2 else "Input"
+                    tag_type = row[3].strip() if len(row) > 3 else "Float"
                     
                     if nid:
                         self.selected_opc_tags[nid] = name
-                        if tag_type.lower() == "output":
+                        self.tag_metadata[nid] = {"type": tag_type}
+                        if mode_str.lower() == "output":
                             self.output_tags.add(nid)
                         else:
                             if nid in self.output_tags: self.output_tags.remove(nid)
@@ -1950,10 +2004,12 @@ class MainWindow(QMainWindow):
             try:
                 with open(f, 'w', newline='') as file:
                     writer = csv.writer(file)
-                    writer.writerow(["NodeID", "Name", "Type"])
+                    writer.writerow(["NodeID", "Name", "Mode", "DataType"])
                     for nid, name in self.selected_opc_tags.items():
-                        tag_type = "Output" if nid in self.output_tags else "Input"
-                        writer.writerow([nid, name, tag_type])
+                        mode_str = "Output" if nid in self.output_tags else "Input"
+                        meta = self.tag_metadata.get(nid, {"type": "Float"})
+                        dtype = meta.get("type", "Float")
+                        writer.writerow([nid, name, mode_str, dtype])
                 QMessageBox.information(self, "Success", f"Exported {len(self.selected_opc_tags)} tags.")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to export CSV: {e}")
