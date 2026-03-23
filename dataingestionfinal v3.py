@@ -270,10 +270,11 @@ class OPCInfluxWorker(QThread):
     data_written = pyqtSignal(str)
     live_data_update = pyqtSignal(str, object)  # UI Signal
 
-    def __init__(self, opc_config, influx_config, selected_tags, write_mode, interval_ms, tag_metadata=None):
+    def __init__(self, opc_config, influx_config, selected_tags, write_mode, interval_ms, tag_metadata=None, db_measurement='kiln1'):
         super().__init__()
         self.opc_config = opc_config
         self.influx_config = influx_config
+        self.db_measurement = db_measurement
         # selected_tags: {nodeId: tagName}
         self.selected_tags = selected_tags
         self.selected_tags_nodeids = list(selected_tags.keys())
@@ -281,7 +282,6 @@ class OPCInfluxWorker(QThread):
         self.write_mode = write_mode
         self.interval_ms = interval_ms
         self._is_running = True
-        self.db_measurement = 'kiln1'
         self.value_history = {}  # {nodeId: deque(maxlen=5)}
 
     def stop(self):
@@ -503,12 +503,12 @@ class SimulatorWorker(QThread):
     data_written = pyqtSignal(str)
     live_data_update = pyqtSignal(str, object)
 
-    def __init__(self, influx_config, csv_file_path):
+    def __init__(self, influx_config, csv_file_path, db_measurement='kiln1'):
         super().__init__()
         self.influx_config = influx_config
         self.csv_file_path = csv_file_path
         self._is_running = True
-        self.db_measurement = getattr(config, 'DB_MEASUREMENT', 'kiln1') if config else 'kiln1'
+        self.db_measurement = db_measurement
 
     def stop(self):
         self._is_running = False
@@ -716,7 +716,7 @@ class PIInfluxWorker(QThread):
     live_data_update = pyqtSignal(str, object)   # webId, value
     worker_finished = pyqtSignal()
 
-    def __init__(self, pi_url, pi_user, pi_password, influx_config, pi_tags, interval_sec, use_api_key=False, pi_api_key=""):
+    def __init__(self, pi_url, pi_user, pi_password, influx_config, pi_tags, interval_sec, use_api_key=False, pi_api_key="", db_measurement='kiln1'):
         super().__init__()
         self.pi_url = pi_url.rstrip('/')
         self.pi_user = pi_user
@@ -728,7 +728,7 @@ class PIInfluxWorker(QThread):
         self.use_api_key = use_api_key
         self.pi_api_key = pi_api_key
         self._is_running = True
-        self.db_measurement = getattr(config, 'DB_MEASUREMENT', 'kiln1') if config else 'kiln1'
+        self.db_measurement = db_measurement
 
     def stop(self):
         self._is_running = False
@@ -912,6 +912,8 @@ class MainWindow(QMainWindow):
         self.selections["selected_opc_tags"] = self.selected_opc_tags
         self.selections["output_tags"] = list(self.output_tags)
         self.selections["tag_metadata"] = self.tag_metadata
+        self.selections["opc_measurement"] = self.opc_measurement_input.text()
+        self.selections["pi_measurement"] = self.pi_measurement_input.text()
         self.selections["csv_file_path"] = self.csv_file_path
         self.selections["pi_url"] = self.pi_url_input.text()
         self.selections["pi_username"] = self.pi_username_input.text()
@@ -997,6 +999,8 @@ class MainWindow(QMainWindow):
         self.disconnect_opc_button = QPushButton("🔌 Disconnect")
         self.disconnect_opc_button.clicked.connect(self.disconnect_opc_server)
         self.disconnect_opc_button.setEnabled(False)
+        self.opc_measurement_input = QLineEdit(self.selections.get("opc_measurement", "kiln1"))
+        f1.addRow("Measurement:", self.opc_measurement_input)
         h1.addWidget(self.connect_opc_button)
         h1.addWidget(self.disconnect_opc_button)
         f1.addRow(h1)
@@ -1132,6 +1136,8 @@ class MainWindow(QMainWindow):
         self.pi_use_api_key_chk.toggled.connect(self._toggle_pi_auth_mode)
 
         f8.addRow("PI Web API URL:", self.pi_url_input)
+        self.pi_measurement_input = QLineEdit(self.selections.get("pi_measurement", "kiln1"))
+        f8.addRow("Measurement:", self.pi_measurement_input)
         f8.addRow(self.pi_use_api_key_chk)
         f8.addRow("API Key:", self.pi_api_key_input)
         f8.addRow("Username:", self.pi_username_input)
@@ -1493,7 +1499,9 @@ class MainWindow(QMainWindow):
         conf = {'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
                 'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()}
         self.opc_worker = OPCInfluxWorker(self._get_opc_config(), conf, self.selected_opc_tags,
-                                          'per_second', self.write_interval_spinbox.value())
+                                          'per_second', self.write_interval_spinbox.value(),
+                                          tag_metadata=self.tag_metadata,
+                                          db_measurement=self.opc_measurement_input.text())
         self.opc_worker.log_message.connect(self.log_widget.appendPlainText)
         self.opc_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.opc_worker.live_data_update.connect(self._on_live_data_update)
@@ -1761,7 +1769,8 @@ class MainWindow(QMainWindow):
             pi_tags=list(self.pi_tags),
             interval_sec=self.pi_interval_spin.value(),
             use_api_key=self.pi_use_api_key_chk.isChecked(),
-            pi_api_key=self.pi_api_key_input.text()
+            pi_api_key=self.pi_api_key_input.text(),
+            db_measurement=self.pi_measurement_input.text()
         )
         self.pi_worker.log_message.connect(self.log_widget.appendPlainText)
         self.pi_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
@@ -1788,7 +1797,7 @@ class MainWindow(QMainWindow):
 
         conf = {'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
                 'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()}
-        self.simulator_worker = SimulatorWorker(conf, self.csv_file_path)
+        self.simulator_worker = SimulatorWorker(conf, self.csv_file_path, db_measurement=self.opc_measurement_input.text())
         self.simulator_worker.log_message.connect(self.log_widget.appendPlainText)
         self.simulator_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.simulator_worker.live_data_update.connect(self._on_live_data_update)
