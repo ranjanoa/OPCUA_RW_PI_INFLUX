@@ -281,71 +281,77 @@ class OPCInfluxWorker(QThread):
         influx = InfluxDBClient(url=self.influx_config['url'], token=self.influx_config['token'],
                                 org=self.influx_config['org'])
         write_api = influx.write_api(write_options=SYNCHRONOUS)
+        
+        reconnect_delay = 5.0
+        while self._is_running:
+            try:
+                self.log_message.emit(f"Connecting to {self.opc_config['url']}...")
+                await asyncio.wait_for(client.connect(), timeout=10.0)
+                self.log_message.emit(f"Connected to {self.opc_config['url']}")
+                self.connection_status.emit(True)
+                reconnect_delay = 5.0 # Reset delay on success
+                
+                nodes = [client.get_node(nid) for nid in self.selected_tags_nodeids]
 
-        try:
-            await asyncio.wait_for(client.connect(), timeout=10.0)
-            self.log_message.emit(f"Connected to {self.opc_config['url']}")
-            self.connection_status.emit(True)
+                while self._is_running:
+                    try:
+                        values = await client.get_values(nodes)
+                        timestamp = datetime.now(timezone.utc)
+                        point = Point(self.db_measurement).time(timestamp, WritePrecision.NS)
 
-            nodes = [client.get_node(nid) for nid in self.selected_tags_nodeids]
+                        log_samples = []
+                        for i, val in enumerate(values):
+                            nid = self.selected_tags_nodeids[i]
+                            tag_name = self.selected_tags.get(nid, nid)
 
-            while self._is_running:
+                            try:
+                                if isinstance(val, bool):
+                                    final_val = val
+                                else:
+                                    final_val = float(val)
+                            except (ValueError, TypeError):
+                                final_val = str(val)
+
+                            if isinstance(final_val, float):
+                                if nid not in self.value_history:
+                                    self.value_history[nid] = deque(maxlen=5)
+
+                                if final_val == 0.0 and len(self.value_history[nid]) > 0:
+                                    avg = sum(self.value_history[nid]) / len(self.value_history[nid])
+                                    if abs(avg) > 0.01:
+                                        final_val = avg
+                                else:
+                                    self.value_history[nid].append(final_val)
+
+                            point.field(tag_name, final_val)
+                            self.live_data_update.emit(nid, final_val)
+                            if i < 3: log_samples.append(f"{tag_name}={final_val}")
+
+                        write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
+                        self.data_written.emit(f"✅ Live: {', '.join(log_samples)}...")
+                    except Exception as e:
+                        self.log_message.emit(f"Read Error: {e}")
+                        # If get_values itself raises a connection-related error, 
+                        # let the outer try catch it and trigger reconnection.
+                        if "connection" in str(e).lower() or "socket" in str(e).lower():
+                            raise
+
+                    await asyncio.sleep(self.interval_ms / 1000.0)
+
+            except Exception as e:
+                self.connection_status.emit(False)
+                if not self._is_running: break
+                self.log_message.emit(f"Connection lost or error: {e}. Retrying in {reconnect_delay}s...")
                 try:
-                    values = await client.get_values(nodes)
-                    timestamp = datetime.now(timezone.utc)
-                    point = Point(self.db_measurement).time(timestamp, WritePrecision.NS)
+                    await client.disconnect()
+                except:
+                    pass
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, 60.0) # Adaptive backoff
 
-                    log_samples = []
-                    for i, val in enumerate(values):
-                        nid = self.selected_tags_nodeids[i]
-                        tag_name = self.selected_tags.get(nid, nid)  # use display name
-
-                        try:
-                            if isinstance(val, bool):
-                                final_val = val
-                            else:
-                                final_val = float(val)
-                        except (ValueError, TypeError):
-                            final_val = str(val)
-
-                        # Moving Average Filter to mask simulator drops to zero
-                        if isinstance(final_val, float):
-                            # Initialize queue if not present
-                            if nid not in self.value_history:
-                                self.value_history[nid] = deque(maxlen=5)
-
-                            # If value drops exactly to 0 but we have recent history that wasn't 0
-                            # Assume it's a spurious drop and substitute the moving average
-                            if final_val == 0.0 and len(self.value_history[nid]) > 0:
-                                avg = sum(self.value_history[nid]) / len(self.value_history[nid])
-                                # Only mask if the average is significantly non-zero
-                                if abs(avg) > 0.01:
-                                    final_val = avg
-                            else:
-                                # Normal case: add the valid value to history
-                                self.value_history[nid].append(final_val)
-
-                        point.field(tag_name, final_val)  # <-- tag name, not NodeID
-
-                        # Emit to UI (still keyed by NodeID for the tag table)
-                        self.live_data_update.emit(nid, final_val)
-
-                        if i < 3: log_samples.append(f"{tag_name}={final_val}")
-
-                    write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
-                    self.data_written.emit(f"✅ Live: {', '.join(log_samples)}...")
-                except Exception as e:
-                    self.log_message.emit(f"Read Error: {e}")
-
-                await asyncio.sleep(self.interval_ms / 1000.0)
-
-        except Exception as e:
-            self.log_message.emit(f"Connection Failed: {e}")
-            self.connection_status.emit(False)
-        finally:
-            await client.disconnect()
-            influx.close()
-            self.worker_finished.emit()
+        self.log_message.emit("Gateway worker finished.")
+        influx.close()
+        self.worker_finished.emit()
 
     def run(self):
         loop = asyncio.new_event_loop()
@@ -522,8 +528,11 @@ class SimulatorWorker(QThread):
                     valid_row = True
 
                 if valid_row:
-                    write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
-                    self.data_written.emit(f"✅ Sim Write: {', '.join(display)}...")
+                    try:
+                        write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
+                        self.data_written.emit(f"✅ Sim Write: {', '.join(display)}...")
+                    except Exception as e:
+                        self.log_message.emit(f"Sim Write Error: {e}")
 
                 idx = (idx + 1) % len(rows)
 
@@ -723,6 +732,7 @@ class PIInfluxWorker(QThread):
                     log_samples = []
 
                     if use_stream_url_mode:
+                        # (rest of the streaming logic)
                         # Call each stream URL individually: GET {url}
                         for t in self.pi_tags:
                             stream_url = t.get('stream_url') or t['webId']
@@ -877,6 +887,7 @@ class MainWindow(QMainWindow):
         self.selections["use_pi_api_key"] = self.pi_use_api_key_chk.isChecked()
         self.selections["pi_api_key"] = self.pi_api_key_input.text()
         self.selections["pi_tags"] = self.pi_tags
+        self.selections["write_interval"] = self.write_interval_spinbox.value() # Save interval
         try:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(self.selections, f, indent=4)
@@ -977,7 +988,7 @@ class MainWindow(QMainWindow):
         self.write_on_change_radio = QRadioButton("On Change")
         self.write_interval_spinbox = QSpinBox()
         self.write_interval_spinbox.setRange(100, 60000)
-        self.write_interval_spinbox.setValue(1000)
+        self.write_interval_spinbox.setValue(self.selections.get("write_interval", 1000)) # Load interval
         self.write_per_sec_radio.setChecked(True)
         h2.addWidget(self.write_per_sec_radio)
         h2.addWidget(self.write_interval_spinbox)

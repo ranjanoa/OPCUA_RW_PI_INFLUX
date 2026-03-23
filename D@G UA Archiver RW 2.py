@@ -199,7 +199,7 @@ class OpcUaArchiverApp(tk.Tk):
         self.rowconfigure(5, weight=1)
 
     def show_message(self, msg):
-        self.lbl_status.config(text=msg[-100:])  # Truncate status
+        self.after(0, lambda: self.lbl_status.config(text=msg[-100:]))
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
     def save_influx_config(self):
@@ -218,7 +218,8 @@ class OpcUaArchiverApp(tk.Tk):
             "password": self.entry_password.get(),
             "influx_token": self.influx_token,
             "influx_org": self.influx_org,
-            "influx_bucket": self.influx_bucket
+            "influx_bucket": self.influx_bucket,
+            "archive_interval": self.entry_archive_interval.get()
         }
 
     def load_config(self):
@@ -232,6 +233,7 @@ class OpcUaArchiverApp(tk.Tk):
                 self.entry_influx_token.delete(0, tk.END); self.entry_influx_token.insert(0, data.get("influx_token", ""))
                 self.entry_influx_org.delete(0, tk.END); self.entry_influx_org.insert(0, data.get("influx_org", "your-org"))
                 self.entry_influx_bucket.delete(0, tk.END); self.entry_influx_bucket.insert(0, data.get("influx_bucket", "opcua_data"))
+                self.entry_archive_interval.delete(0, tk.END); self.entry_archive_interval.insert(0, data.get("archive_interval", "1"))
                 self.influx_token = data.get("influx_token", "")
                 self.show_message("Config loaded")
             except Exception as e:
@@ -341,7 +343,7 @@ class OpcUaArchiverApp(tk.Tk):
         threading.Thread(target=self.load_tree, daemon=True).start()
     def load_tree(self):
         if not self.client: return
-        self.tree.delete(*self.tree.get_children())
+        self.after(0, lambda: self.tree.delete(*self.tree.get_children()))
         try:
             async def populate():
                 root = self.client.nodes.root
@@ -349,15 +351,19 @@ class OpcUaArchiverApp(tk.Tk):
                 display = (await objects_node.read_display_name()).Text
                 nodeid = objects_node.nodeid.to_string()
                 
-                # Insert top-level node
-                item = self.tree.insert("", "end", text=display, values=(nodeid,))
-                # Add dummy child to make it expandable
-                self.tree.insert(item, "end", text="loading...")
+                # Insert top-level node safely
+                self.after(0, self._add_node_to_tree, "", display, nodeid)
                 
             self._run_async_threadsafe(populate())
             self.show_message("Root loaded. Expand to browse.")
         except Exception as e:
             self.show_message(f"Tree error: {e}")
+
+    def _add_node_to_tree(self, parent_item, text, nodeid):
+        """Helper to safely insert a node and a dummy child from the main thread"""
+        item = self.tree.insert(parent_item, "end", text=text, values=(nodeid,))
+        self.tree.insert(item, "end", text="loading...")
+
 
     def on_tree_open(self, event):
         item = self.tree.focus()
@@ -376,11 +382,8 @@ class OpcUaArchiverApp(tk.Tk):
                 for sub in subs:
                     sub_display = (await sub.read_display_name()).Text
                     sub_nodeid = sub.nodeid.to_string()
-                    sub_item = self.tree.insert(item, "end", text=sub_display, values=(sub_nodeid,))
-                    
-                    # Add dummy if it's likely to have children (Object or Variable with children)
-                    # For simplicity, we add it to everything and remove if it fails to browse
-                    self.tree.insert(sub_item, "end", text="loading...")
+                    # Schedule UI update on main thread
+                    self.after(0, self._add_node_to_tree, item, sub_display, sub_nodeid)
             
             try:
                 self._run_async_threadsafe(load_subs())
