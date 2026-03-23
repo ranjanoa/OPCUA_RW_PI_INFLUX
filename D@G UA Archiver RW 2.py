@@ -94,8 +94,13 @@ class OpcUaArchiverApp(tk.Tk):
         threading.Thread(target=run_loop, args=(self.async_loop,), daemon=True).start()
 
     def _run_async_threadsafe(self, coro):
+        """Run a coroutine on the background thread and WAIT for the result (blocks caller)"""
         future = asyncio.run_coroutine_threadsafe(coro, self.async_loop)
         return future.result()
+
+    def _run_async_non_blocking(self, coro):
+        """Run a coroutine on the background thread without waiting (fire and forget)"""
+        asyncio.run_coroutine_threadsafe(coro, self.async_loop)
 
     def _build_ui(self):
         # Row 0: OPC UA Connection
@@ -386,7 +391,7 @@ class OpcUaArchiverApp(tk.Tk):
                     self.after(0, self._add_node_to_tree, item, sub_display, sub_nodeid)
             
             try:
-                self._run_async_threadsafe(load_subs())
+                self._run_async_non_blocking(load_subs())
             except Exception as e:
                 self.show_message(f"Browse error: {e}")
 
