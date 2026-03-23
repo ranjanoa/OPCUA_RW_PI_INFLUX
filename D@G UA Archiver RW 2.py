@@ -144,6 +144,7 @@ class OpcUaArchiverApp(tk.Tk):
         self.tree.heading("#0", text="OPC UA Tags")
         self.tree.grid(row=3, column=0, columnspan=8, sticky="nsew", padx=5, pady=2)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
         scrollbar_tree = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         scrollbar_tree.grid(row=3, column=8, sticky="ns", pady=2)
         self.tree.configure(yscrollcommand=scrollbar_tree.set)
@@ -338,27 +339,53 @@ class OpcUaArchiverApp(tk.Tk):
     # Tree & Manual tags (your logic + auto-add)
     def load_tree_thread(self):
         threading.Thread(target=self.load_tree, daemon=True).start()
-
     def load_tree(self):
         if not self.client: return
         self.tree.delete(*self.tree.get_children())
         try:
             async def populate():
                 root = self.client.nodes.root
-                objs = await root.get_child(["0:Objects"])
-                await self._populate_tree(objs, "")
+                objects_node = await root.get_child(["0:Objects"])
+                display = (await objects_node.read_display_name()).Text
+                nodeid = objects_node.nodeid.to_string()
+                
+                # Insert top-level node
+                item = self.tree.insert("", "end", text=display, values=(nodeid,))
+                # Add dummy child to make it expandable
+                self.tree.insert(item, "end", text="loading...")
+                
             self._run_async_threadsafe(populate())
-            self.show_message("Tree loaded")
+            self.show_message("Root loaded. Expand to browse.")
         except Exception as e:
             self.show_message(f"Tree error: {e}")
 
-    async def _populate_tree(self, node, parent):
-        children = await node.get_children()
-        for child in children:
-            display = (await child.read_display_name()).Text
-            nodeid = child.nodeid.to_string()
-            self.tree.insert(parent, "end", text=display, values=(nodeid,))
-            await self._populate_tree(child, self.tree.get_children(parent)[-1])
+    def on_tree_open(self, event):
+        item = self.tree.focus()
+        if not item: return
+        
+        # Check if already loaded (has real children or no dummy)
+        children = self.tree.get_children(item)
+        if len(children) == 1 and self.tree.item(children[0])["text"] == "loading...":
+            # Replace dummy with real content
+            self.tree.delete(children[0])
+            nodeid = self.tree.item(item)["values"][0]
+            
+            async def load_subs():
+                node = self.client.get_node(nodeid)
+                subs = await node.get_children()
+                for sub in subs:
+                    sub_display = (await sub.read_display_name()).Text
+                    sub_nodeid = sub.nodeid.to_string()
+                    sub_item = self.tree.insert(item, "end", text=sub_display, values=(sub_nodeid,))
+                    
+                    # Add dummy if it's likely to have children (Object or Variable with children)
+                    # For simplicity, we add it to everything and remove if it fails to browse
+                    self.tree.insert(sub_item, "end", text="loading...")
+            
+            try:
+                self._run_async_threadsafe(load_subs())
+            except Exception as e:
+                self.show_message(f"Browse error: {e}")
 
     def on_tree_select(self, event):
         sel = self.tree.selection()
