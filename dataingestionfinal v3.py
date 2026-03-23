@@ -2042,14 +2042,31 @@ class MainWindow(QMainWindow):
         self.start_api_button.setEnabled(True)
 
     def closeEvent(self, e):
-        if self.opc_worker: self.opc_worker.stop()
-        if self.simulator_worker: self.simulator_worker.stop()
-        if self.watcher_worker: self.watcher_worker.stop()
-        if hasattr(self, 'api_worker') and self.api_worker: self.api_worker.stop()
-        if self.opc_client:
-            pass
-        self._save_selections()
+        # Systematic shutdown of all workers and forceful process termination
+        # to prevent background zombie processes on Windows.
+        try:
+            if self.opc_worker: self.opc_worker.stop()
+            if self.pi_worker: self.pi_worker.stop()
+            if self.simulator_worker: self.simulator_worker.stop()
+            if self.watcher_worker: self.watcher_worker.stop()
+            if hasattr(self, 'api_worker') and self.api_worker: self.api_worker.stop()
+            
+            # Briefly wait for workers to cleanup resources (e.g. InfluxDB final writes)
+            workers = [self.opc_worker, self.pi_worker, self.simulator_worker, self.watcher_worker]
+            if hasattr(self, 'api_worker'): workers.append(self.api_worker)
+            
+            for w in workers:
+                if w and w.isRunning():
+                    w.wait(200) # 200ms grace period per worker
+            
+            self._save_selections()
+        except Exception as ex:
+            logging.error(f"Error during shutdown: {ex}")
+            
         e.accept()
+        # Forceful exit - this ensures all threads (daemon or not) are killed instantly.
+        # This is the only way to ensure 100% cleanup if library threads are hanging.
+        os._exit(0)
 
 
 if __name__ == "__main__":
