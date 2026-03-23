@@ -392,7 +392,7 @@ class OPCInfluxWorker(QThread):
 class SetpointWatcherWorker(QThread):
     log_msg = pyqtSignal(str)
 
-    def __init__(self, opc_config, influx_config, allowed_setpoints_map):
+    def __init__(self, opc_config, influx_config, allowed_setpoints_map, db_measurement='kiln2'):
         super().__init__()
         self.opc_config = opc_config
         self.influx_config = influx_config
@@ -400,7 +400,7 @@ class SetpointWatcherWorker(QThread):
         self.valid_node_ids = set(allowed_setpoints_map.values())
         self.running = True
         self.influx_bucket = influx_config.get('bucket', 'kiln_process_data')
-        self.write_back_meas = 'kiln2'
+        self.write_back_meas = db_measurement
 
     def stop(self):
         self.running = False
@@ -1825,7 +1825,8 @@ class MainWindow(QMainWindow):
                 'org': self.influx_org_input.text(),
                 'bucket': self.influx_bucket_input.text()
             }
-            self.watcher_worker = SetpointWatcherWorker(conf, influx_conf, self.model_setpoints)
+            wb_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2')
+            self.watcher_worker = SetpointWatcherWorker(conf, influx_conf, self.model_setpoints, db_measurement=wb_meas)
             self.watcher_worker.log_msg.connect(self.log_widget.appendPlainText)
             self.watcher_worker.start()
             self.watcher_status.setText("Status: Running")
