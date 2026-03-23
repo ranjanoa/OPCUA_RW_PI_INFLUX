@@ -209,12 +209,13 @@ class ServerBrowseDialog(QDialog):
         except Exception as e:
             logging.error(f"Browser Error: {e}")
 
-    def on_item_expanded(self, item):
+    @qasync.asyncSlot()
+    async def on_item_expanded(self, item):
         if item.childCount() == 1 and item.child(0).text(0) == "loading...":
             item.removeChild(item.child(0))
             node_id = item.text(1)
-            # Launch async task to load children
-            asyncio.create_task(self._add_children_to_tree(self.client, node_id, item))
+            # await the async loading
+            await self._add_children_to_tree(self.client, node_id, item)
 
     async def _add_children_to_tree(self, client, node_id, parent_item):
         try:
@@ -1384,7 +1385,14 @@ class MainWindow(QMainWindow):
             dlg = ServerBrowseDialog(self)
             dlg.tags_selected.connect(self._on_tags_selected)
             await dlg.populate_tree(self.opc_client, self.selected_opc_tags.keys())
-            dlg.exec()
+            
+            # Non-blocking async execution of the dialog
+            # Create a future to wait for the dialog to close
+            done = asyncio.get_event_loop().create_future()
+            dlg.finished.connect(lambda r: done.set_result(r) if not done.done() else None)
+            dlg.show()
+            await done
+
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.opc_client_connected.emit(False)
