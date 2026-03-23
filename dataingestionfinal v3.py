@@ -223,13 +223,12 @@ class ServerBrowseDialog(QDialog):
         except Exception as e:
             logging.error(f"Browser Error: {e}")
 
-    @qasync.asyncSlot()
-    async def on_item_expanded(self, item):
+    def on_item_expanded(self, item):
         if item.childCount() == 1 and item.child(0).text(0) == "loading...":
             item.removeChild(item.child(0))
             node_id = item.text(1)
-            # await the async loading
-            await self._add_children_to_tree(self.client, node_id, item)
+            # Create a task on the running loop
+            asyncio.create_task(self._add_children_to_tree(self.client, node_id, item))
 
     async def _add_children_to_tree(self, client, node_id, parent_item):
         try:
@@ -1440,7 +1439,6 @@ class MainWindow(QMainWindow):
         self.disconnect_opc_button.setEnabled(False)
         self.opc_connection_status_label.setText("Status: Disconnected")
         self.opc_connection_status_label.setStyleSheet("color: #f44336; font-weight: bold;")
-        self.write_box.setEnabled(False)
         self._update_write_combo()
         if self.stop_gateway_button.isEnabled(): self.stop_gateway()
         self.opc_client_connected.emit(False)
