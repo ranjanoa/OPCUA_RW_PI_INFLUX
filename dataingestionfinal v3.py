@@ -1825,7 +1825,8 @@ class MainWindow(QMainWindow):
                 'org': self.influx_org_input.text(),
                 'bucket': self.influx_bucket_input.text()
             }
-            wb_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2')
+            wb_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2') if config is not None else 'kiln2'
+            self.log_widget.appendPlainText(f"Starting Setpoint Watcher using measurement: {wb_meas}")
             self.watcher_worker = SetpointWatcherWorker(conf, influx_conf, self.model_setpoints, db_measurement=wb_meas)
             self.watcher_worker.log_msg.connect(self.log_widget.appendPlainText)
             self.watcher_worker.start()
