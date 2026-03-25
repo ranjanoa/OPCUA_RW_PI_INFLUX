@@ -355,7 +355,7 @@ class OPCInfluxWorker(QThread):
                                 if len(log_samples) < 3: log_samples.append(f"{tag_name}={final_val}")
 
                         write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
-                        self.data_written.emit(f"✅ Live: {', '.join(log_samples)}...")
+                        self.data_written.emit(f"✅ Live: {', '.join(log_samples)} ({len(log_samples)} fields)")
                     except Exception as e:
                         self.log_message.emit(f"Read Error: {e}")
                         # If get_values itself raises a connection-related error, 
@@ -1907,6 +1907,9 @@ class MainWindow(QMainWindow):
         self.selected_tags_tree.clear()
         self.write_tag_combo.clear()
         self.tag_item_map.clear()
+        self.pi_tag_item_map.clear()
+
+        # 1. OPC Tags
         for nid, name in self.selected_opc_tags.items():
             mode_str = "[OUTPUT]" if nid in self.output_tags else "[INPUT]"
             meta = self.tag_metadata.get(nid, {"type": "Float"})
@@ -1914,16 +1917,26 @@ class MainWindow(QMainWindow):
             
             item = QTreeWidgetItem([name, nid, mode_str, type_str, "---"])
             item.setData(1, Qt.ItemDataRole.UserRole, nid)
-            # Allow Tag Name (col 0) to be edited inline by double-clicking
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-            
-            # Use distinct colors for Mode and Type columns
             item.setForeground(2, QColor("#61dafb"))
             item.setForeground(3, QColor("#ffcc00"))
             
             self.selected_tags_tree.addTopLevelItem(item)
             self.tag_item_map[nid] = item
             if nid in self.output_tags: self.write_tag_combo.addItem(f"{name} ({nid})", userData=nid)
+
+        # 2. PI Tags
+        for tag in self.pi_tags:
+            wid = tag.get('webId', '')
+            name = tag.get('name', 'Unknown')
+            alias = tag.get('alias', name)
+            
+            item = QTreeWidgetItem([alias, wid, "[PI-IN]", "[Float]", "---"])
+            item.setData(1, Qt.ItemDataRole.UserRole, wid)
+            item.setForeground(2, QColor("#a6e3a1")) # Green for PI
+            self.selected_tags_tree.addTopLevelItem(item)
+            self.pi_tag_item_map[wid] = item
+
         self._update_write_combo()
 
     def _on_tag_item_clicked(self, item, column):
@@ -1945,13 +1958,14 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, object)
     def _on_live_data_update(self, nodeid, value):
-        if nodeid in self.tag_item_map:
-            item = self.tag_item_map[nodeid]
+        # Try both OPC and PI maps
+        item = self.tag_item_map.get(nodeid) or self.pi_tag_item_map.get(nodeid)
+        if item:
             if isinstance(value, float):
                 val_str = f"{value:.3f}"
             else:
                 val_str = str(value)
-            item.setText(4, val_str) # Value is now col 4
+            item.setText(4, val_str)
 
     def _on_tag_name_changed(self, item, column):
         """Called when user double-clicks and edits a tag name cell."""
