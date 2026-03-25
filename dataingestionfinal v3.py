@@ -433,7 +433,7 @@ class SetpointWatcherWorker(QThread):
                     pass
 
             while self.running:
-                q = f'from(bucket:"{self.influx_bucket}") |> range(start: -1m) |> filter(fn: (r) => r["_measurement"] == "{self.write_back_meas}") |> last()'
+                q = f'from(bucket:"{self.influx_bucket}") |> range(start: -24h) |> filter(fn: (r) => r["_measurement"] == "{self.write_back_meas}") |> last()'
                 try:
                     # Run synchronous InfluxDB query in a thread to prevent freezing the asyncio loop
                     tables = await asyncio.to_thread(query_api.query, q)
@@ -441,8 +441,9 @@ class SetpointWatcherWorker(QThread):
                     new_cmd = {}
                     for tbl in tables:
                         for rec in tbl.records:
-                            ts = rec.get_time()
-                            new_cmd[rec.get_field()] = rec.get_value()
+                            val = rec.get_value()
+                            if val is not None:
+                                new_cmd[rec.get_field()] = val
 
                     if new_cmd:
                         # Only log if there's actually a new or changed value
