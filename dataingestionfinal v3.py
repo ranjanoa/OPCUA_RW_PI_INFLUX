@@ -1,7 +1,7 @@
 import sys
 import os
 import asyncio
-# VERSION 3.0 (Stabilized)
+# VERSION 3.0 (Subscription-Based OPC UA + Queue Batching)
 import logging
 import json
 import csv
@@ -77,7 +77,6 @@ async def setup_opc_security(client, opc_config):
                     logging.info(f"Set security to {policy.__name__} in mode {mode.name}")
                     break
                 except Exception as e:
-                    # Silently try next combination
                     continue
             if connected_with_security:
                 break
@@ -89,7 +88,7 @@ async def setup_opc_security(client, opc_config):
     if password: client.set_password(password)
 
 
-# --- CONFIGURATION ---U
+# --- CONFIGURATION ---
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".opc_influx_client_selections.json")
 ICON_FILE = 'app_icon.ico'
 
@@ -219,7 +218,6 @@ class ServerBrowseDialog(QDialog):
             node_class = await target_node.read_node_class()
             
             root_item = QTreeWidgetItem(self.tree, [display, node_id, node_class.name, ""])
-            # Add dummy child if it's an object to allow expansion
             if node_class == ua.NodeClass.Object:
                 QTreeWidgetItem(root_item, ["loading..."])
             root_item.setExpanded(False)
@@ -230,7 +228,6 @@ class ServerBrowseDialog(QDialog):
         if item.childCount() == 1 and item.child(0).text(0) == "loading...":
             item.removeChild(item.child(0))
             node_id = item.text(1)
-            # Create a task on the running loop
             asyncio.create_task(self._add_children_to_tree(self.client, node_id, item))
 
     async def _add_children_to_tree(self, client, node_id, parent_item):
@@ -248,7 +245,6 @@ class ServerBrowseDialog(QDialog):
                     item.setCheckState(0,
                                        Qt.CheckState.Checked if child_node_id in self.selected_node_ids else Qt.CheckState.Unchecked)
                 elif node_class == ua.NodeClass.Object:
-                    # Add dummy for lazy loading
                     QTreeWidgetItem(item, ["loading..."])
         except Exception as e:
             logging.error(f"Error loading children for {node_id}: {e}")
@@ -265,38 +261,54 @@ class ServerBrowseDialog(QDialog):
         self.accept()
 
 
-# --- WORKER: OPC UA -> INFLUXDB ---
+# --- WORKER: OPC UA -> INFLUXDB (SUBSCRIPTION MODE) ---
+
+class OPCSubscriptionHandler:
+    """Handles incoming data change events from the OPC UA Server"""
+    def __init__(self, worker):
+        self.worker = worker
+
+    def datachange_notification(self, node, val, data):
+        # Triggered automatically by the server when a tag changes
+        nid = node.nodeid.to_string()
+        status = data.monitored_item.Value.StatusCode
+        timestamp = datetime.now(timezone.utc)
+        
+        # Put the new data into the worker's processing queue
+        self.worker.data_queue.put_nowait((nid, val, status, timestamp))
+
+
 class OPCInfluxWorker(QThread):
     log_message = pyqtSignal(str)
     connection_status = pyqtSignal(bool)
     worker_finished = pyqtSignal()
     data_written = pyqtSignal(str)
-    live_data_update = pyqtSignal(str, object)  # UI Signal
+    live_data_update = pyqtSignal(str, object)
 
     def __init__(self, opc_config, influx_config, selected_tags, write_mode, interval_ms, tag_metadata=None, db_measurement='kiln1'):
         super().__init__()
         self.opc_config = opc_config
         self.influx_config = influx_config
         self.db_measurement = db_measurement
-        # selected_tags: {nodeId: tagName}
         self.selected_tags = selected_tags
         self.selected_tags_nodeids = list(selected_tags.keys())
         self.tag_metadata = tag_metadata or {}
-        self.write_mode = write_mode
-        self.interval_ms = interval_ms
+        self.interval_ms = max(interval_ms, 100) # Minimum 100ms
         self._is_running = True
-        self.value_history = {}  # {nodeId: deque(maxlen=5)}
+        
+        self.value_history = {}
+        self._last_errors = {}
+        self.data_queue = asyncio.Queue()
 
     def stop(self):
         self._is_running = False
-        self.log_message.emit("Stopping Gateway...")
+        self.log_message.emit("Stopping Subscription Gateway...")
 
     async def run_process(self):
         client = Client(url=self.opc_config['url'])
         await setup_opc_security(client, self.opc_config)
         
-        influx = InfluxDBClient(url=self.influx_config['url'], token=self.influx_config['token'],
-                                org=self.influx_config['org'])
+        influx = InfluxDBClient(url=self.influx_config['url'], token=self.influx_config['token'], org=self.influx_config['org'])
         write_api = influx.write_api(write_options=SYNCHRONOUS)
         
         reconnect_delay = 5.0
@@ -304,80 +316,113 @@ class OPCInfluxWorker(QThread):
             try:
                 self.log_message.emit(f"Connecting to {self.opc_config['url']}...")
                 await asyncio.wait_for(client.connect(), timeout=10.0)
-                self.log_message.emit(f"Connected to {self.opc_config['url']}")
+                self.log_message.emit(f"Connected. Setting up subscriptions...")
                 self.connection_status.emit(True)
-                reconnect_delay = 5.0 # Reset delay on success
+                reconnect_delay = 5.0
                 
+                # 1. Setup Subscription
+                handler = OPCSubscriptionHandler(self)
+                sub = await client.create_subscription(self.interval_ms, handler)
+                
+                # 2. Subscribe to Nodes in chunks (to respect server limits)
                 nodes = [client.get_node(nid) for nid in self.selected_tags_nodeids]
+                CHUNK_SIZE = 50
+                for i in range(0, len(nodes), CHUNK_SIZE):
+                    chunk = nodes[i:i + CHUNK_SIZE]
+                    await sub.subscribe_data_change(chunk)
+                
+                self.log_message.emit("✅ Successfully subscribed to all tags! Listening for live changes...")
 
+                # 3. Queue Processing Loop (Writes changes to DB as they arrive)
                 while self._is_running:
                     try:
-                        values = await client.get_values(nodes)
-                        timestamp = datetime.now(timezone.utc)
-                        point = Point(self.db_measurement).time(timestamp, WritePrecision.NS)
-
+                        # Wait for the next datachange notification (with timeout to check _is_running)
+                        nid, val, status, timestamp = await asyncio.wait_for(self.data_queue.get(), timeout=1.0)
+                        
+                        points_to_write = []
+                        nids_and_vals = []
                         log_samples = []
-                        for i, val in enumerate(values):
-                            nid = self.selected_tags_nodeids[i]
-                            tag_name = self.selected_tags.get(nid, nid)
-                            meta = self.tag_metadata.get(nid, {"type": "Float"})
-                            expected_type = meta.get("type", "Float")
-                            # VERSION 3.0 ULTRA-SILENT NULL CHECK
-                            if val is None or str(type(val)) == "<class 'NoneType'>":
-                                continue  # SILENT skip for nulls (patched for type-mismatch)
 
+                        # Helper function to process a single item
+                        def process_item(q_nid, q_val, q_status, q_ts):
+                            tag_name = self.selected_tags.get(q_nid, q_nid)
+                            
+                            # Check Status
+                            if not q_status.is_good():
+                                if self._last_errors.get(q_nid) != q_status.name:
+                                    self.log_message.emit(f"⚠️ Bad Quality '{tag_name}': {q_status.name}")
+                                    self._last_errors[q_nid] = q_status.name
+                                return False
+                                
+                            if q_nid in self._last_errors:
+                                self.log_message.emit(f"✅ Recovered '{tag_name}'")
+                                del self._last_errors[q_nid]
+
+                            # Type conversion
+                            meta = self.tag_metadata.get(q_nid, {"type": "Float"})
+                            expected_type = meta.get("type", "Float")
                             final_val = None
                             try:
-                                if expected_type == "String":
-                                    final_val = str(val)
-                                elif expected_type == "Bool":
-                                    final_val = bool(val)
-                                else: # Float
-                                    final_val = float(val)
-                            except (ValueError, TypeError):
-                                # Skip
-                                logging.warning(f"[V3.0] Skipping {tag_name} due to type mismatch (Expected {expected_type}, Got {type(val)})")
-                                continue
+                                if expected_type == "String": final_val = str(q_val)
+                                elif expected_type == "Bool": final_val = bool(q_val)
+                                else: final_val = float(q_val)
+                            except: return False
 
+                            # Smoothing for Floats
                             if expected_type == "Float":
-                                if nid not in self.value_history:
-                                    self.value_history[nid] = deque(maxlen=5)
-
-                                if final_val == 0.0 and len(self.value_history[nid]) > 0:
-                                    avg = sum(self.value_history[nid]) / len(self.value_history[nid])
-                                    if abs(avg) > 0.01:
-                                        final_val = avg
+                                if q_nid not in self.value_history:
+                                    self.value_history[q_nid] = deque(maxlen=5)
+                                if final_val == 0.0 and len(self.value_history[q_nid]) > 0:
+                                    avg = sum(self.value_history[q_nid]) / len(self.value_history[q_nid])
+                                    if abs(avg) > 0.01: final_val = avg
                                 else:
-                                    self.value_history[nid].append(final_val)
+                                    self.value_history[q_nid].append(final_val)
 
                             if final_val is not None:
-                                point.field(tag_name, final_val)
-                                self.live_data_update.emit(nid, final_val)
+                                p = Point(self.db_measurement).time(q_ts, WritePrecision.NS).field(tag_name, final_val)
+                                points_to_write.append(p)
+                                nids_and_vals.append((q_nid, final_val))
                                 if len(log_samples) < 3: log_samples.append(f"{tag_name}={final_val}")
-                                # Temporary Trace Log
-                                self.log_message.emit(f"DEBUG Trace: {tag_name} = {final_val}")
+                                return True
+                            return False
 
-                        write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
-                        self.data_written.emit(f"✅ Live: {', '.join(log_samples)} ({len(log_samples)} fields)")
-                    except Exception as e:
-                        self.log_message.emit(f"Read Error: {e}")
-                        # If get_values itself raises a connection-related error, 
-                        # let the outer try catch it and trigger reconnection.
-                        if "connection" in str(e).lower() or "socket" in str(e).lower():
-                            raise
+                        # Process the first item
+                        process_item(nid, val, status, timestamp)
 
-                    await asyncio.sleep(self.interval_ms / 1000.0)
+                        # Drain the rest of the queue instantly to batch them together!
+                        while not self.data_queue.empty():
+                            try:
+                                q_nid, q_val, q_status, q_ts = self.data_queue.get_nowait()
+                                process_item(q_nid, q_val, q_status, q_ts)
+                            except asyncio.QueueEmpty:
+                                break
+
+                        # Write Batch to InfluxDB
+                        if points_to_write:
+                            write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=points_to_write)
+                            
+                            # Update UI
+                            for n, fv in nids_and_vals:
+                                self.live_data_update.emit(n, fv)
+                            self.data_written.emit(f"⚡ Sub Update: {', '.join(log_samples)} ({len(points_to_write)} updates)")
+
+                    except asyncio.TimeoutError:
+                        # Just looping around to check if _is_running is still True
+                        continue
+
+                # Cleanup Subscriptions when stopped
+                try:
+                    await sub.delete()
+                except: pass
 
             except Exception as e:
                 self.connection_status.emit(False)
                 if not self._is_running: break
-                self.log_message.emit(f"Connection lost or error: {e}. Retrying in {reconnect_delay}s...")
-                try:
-                    await client.disconnect()
-                except:
-                    pass
+                self.log_message.emit(f"Connection error/lost: {e}. Retrying in {reconnect_delay}s...")
+                try: await client.disconnect()
+                except: pass
                 await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 1.5, 60.0) # Adaptive backoff
+                reconnect_delay = min(reconnect_delay * 1.5, 60.0)
 
         self.log_message.emit("Gateway worker finished.")
         influx.close()
@@ -420,17 +465,15 @@ class SetpointWatcherWorker(QThread):
         try:
             await asyncio.wait_for(client.connect(), timeout=10.0)
             self.log_msg.emit(f"Watcher Active on '{self.write_back_meas}'")
-            last_cmd = {}  # holds last known setpoints to continuously re-assert
-            last_logged_writes = {} # tracks actual state pushed to OPC server
+            last_cmd = {}  
+            last_logged_writes = {} 
             
-            # Cache nodes and their VariantTypes to prevent asyncua from re-requesting on every loop tick
             cached_nodes = {}
             cached_types = {}
             for nid in self.valid_node_ids:
                 try:
                     nd = client.get_node(nid)
                     cached_nodes[nid] = nd
-                    # Fetch and store exact datatype once at startup!
                     cached_types[nid] = await nd.read_data_type_as_variant_type()
                 except Exception:
                     pass
@@ -438,9 +481,7 @@ class SetpointWatcherWorker(QThread):
             while self.running:
                 q = f'from(bucket:"{self.influx_bucket}") |> range(start: -24h) |> filter(fn: (r) => r["_measurement"] == "{self.write_back_meas}") |> last()'
                 try:
-                    # Run synchronous InfluxDB query in a thread to prevent freezing the asyncio loop
                     tables = await asyncio.to_thread(query_api.query, q)
-                    ts = None
                     new_cmd = {}
                     for tbl in tables:
                         for rec in tbl.records:
@@ -449,40 +490,27 @@ class SetpointWatcherWorker(QThread):
                                 new_cmd[rec.get_field()] = val
 
                     if new_cmd:
-                        # Only log if there's actually a new or changed value
                         if any(last_cmd.get(k) != v for k, v in new_cmd.items()):
                             self.log_msg.emit(f"New Command from {self.write_back_meas}: {new_cmd}")
-                        # Update the persistent dictionary instead of replacing it,
-                        # so that tags older than 1m aren't forgotten and reset to 0
                         last_cmd.update(new_cmd)
 
                 except Exception as e:
                     self.log_msg.emit(f"Query Error: {e}")
-                    # Brief pause on error to avoid spamming thread pool
                     await asyncio.sleep(1)
 
-                # Re-assert ALL last known setpoints every cycle
-                # (prevents simulation engines from resetting values automatically)
                 for field_name, val in last_cmd.items():
                     target_id = self.allowed_setpoints_map.get(field_name, field_name)
                     if target_id in self.valid_node_ids and target_id in cached_nodes:
                         try:
                             node = cached_nodes[target_id]
                             vtype = cached_types.get(target_id, ua.VariantType.Double)
-                            
-                            # Build exact variant. Bypasses asyncua background type queries.
                             dv = ua.DataValue(ua.Variant(float(val), vtype))
+                            await asyncio.wait_for(node.write_value(dv), timeout=5.0)
                             
-                            await asyncio.wait_for(
-                                node.write_value(dv),
-                                timeout=5.0
-                            )
-                            # Only log to UI if the value has actually changed, to avoid spam
                             if last_logged_writes.get(target_id) != val:
                                 self.log_msg.emit(f"--> WROTE: {target_id} = {val}")
                                 last_logged_writes[target_id] = val
                         except Exception as e:
-                            # Only log error if different than before to avoid spam
                             if last_logged_writes.get(target_id) != "ERROR":
                                 self.log_msg.emit(f"Write Error {target_id}: {e}")
                                 last_logged_writes[target_id] = "ERROR"
@@ -551,8 +579,6 @@ class SimulatorWorker(QThread):
                             continue
 
                     point.field(col.strip(), val)
-                    # point.tag("node_id", f"sim_{col.strip()}")  <-- Commented out
-
                     self.live_data_update.emit(col.strip(), val)
 
                     if len(display) < 3: display.append(f"{col}={val}")
@@ -624,13 +650,11 @@ class APIWorker(QThread):
 
 # --- PI WEB API HELPERS ---
 def _pi_get(url, username, password, verify=False):
-    """Authenticated GET to PI Web API, returns parsed JSON or raises."""
     resp = requests.get(url, auth=(username, password), verify=verify, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 def _pi_search_tags(base_url, username, password, query, verify=False):
-    """Search PI tags by name query. Returns list of {name, webId} dicts."""
     url = f"{base_url.rstrip('/')}/search?q={requests.utils.quote(query)}&scope=pi&count=200"
     data = _pi_get(url, username, password, verify=verify)
     results = []
@@ -644,7 +668,7 @@ def _pi_search_tags(base_url, username, password, query, verify=False):
 
 # --- PI TAG SEARCH DIALOG ---
 class PITagSearchDialog(QDialog):
-    tags_added = pyqtSignal(list)  # list of {name, webId, alias}
+    tags_added = pyqtSignal(list)
 
     def __init__(self, pi_url, pi_user, pi_password, parent=None):
         super().__init__(parent)
@@ -718,7 +742,7 @@ class PITagSearchDialog(QDialog):
 class PIInfluxWorker(QThread):
     log_message = pyqtSignal(str)
     data_written = pyqtSignal(str)
-    live_data_update = pyqtSignal(str, object)   # webId, value
+    live_data_update = pyqtSignal(str, object)
     worker_finished = pyqtSignal()
 
     def __init__(self, pi_url, pi_user, pi_password, influx_config, pi_tags, interval_sec, use_api_key=False, pi_api_key="", db_measurement='kiln1'):
@@ -727,7 +751,6 @@ class PIInfluxWorker(QThread):
         self.pi_user = pi_user
         self.pi_password = pi_password
         self.influx_config = influx_config
-        # pi_tags: list of {webId, name, alias}
         self.pi_tags = pi_tags
         self.interval_sec = interval_sec
         self.use_api_key = use_api_key
@@ -749,11 +772,8 @@ class PIInfluxWorker(QThread):
             write_api = influx.write_api(write_options=SYNCHRONOUS)
             self.log_message.emit(f"PI Gateway started → {self.db_measurement}")
 
-            # Build webId → alias map and batch webId list
             web_ids = [t['webId'] for t in self.pi_tags]
             alias_map = {t['webId']: t.get('alias') or t['name'] for t in self.pi_tags}
-
-            # Detect mode: stream_url or classic WebID batch
             use_stream_url_mode = any(t.get('stream_url') or t['webId'].startswith('http') for t in self.pi_tags)
 
             while self._is_running:
@@ -763,53 +783,35 @@ class PIInfluxWorker(QThread):
                     log_samples = []
 
                     if use_stream_url_mode:
-                        # (rest of the streaming logic)
-                        # Call each stream URL individually: GET {url}
                         for t in self.pi_tags:
                             stream_url = t.get('stream_url') or t['webId']
                             alias = alias_map.get(t['webId'], t.get('alias', t['name']))
                             try:
                                 auth = None if self.use_api_key else (self.pi_user, self.pi_password)
-                                resp = requests.get(
-                                    stream_url,
-                                    auth=auth,
-                                    verify=False,
-                                    timeout=10
-                                )
+                                resp = requests.get(stream_url, auth=auth, verify=False, timeout=10)
                                 resp.raise_for_status()
                                 data = resp.json()
                                 
-                                # Extract value from the specific {"data": [{"Value": X}]} structure
                                 if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
                                     raw = data["data"][0].get("Value", data)
                                 else:
-                                    # Fallback for standard PI Web API formats
                                     val_obj = data.get('Value', data)
                                     raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
-                                if raw is None:
-                                    continue
+                                if raw is None: continue
                                 try:
                                     val = float(raw)
                                     point.field(alias, val)
                                     self.live_data_update.emit(t['webId'], val)
                                     if len(log_samples) < 3: log_samples.append(f"{alias}={val}")
                                 except (ValueError, TypeError):
-                                    logging.warning(f"Skipping PI field {alias} due to non-numeric value: {raw}")
                                     continue
                             except Exception as e:
                                 self.log_message.emit(f"PI Stream Error [{alias}]: {e}")
                     else:
-                        # Classic batch mode using /streamsets/value
                         batch_url = f"{self.pi_url}/streamsets/value"
                         payload = [{'WebId': wid} for wid in web_ids]
                         auth = None if self.use_api_key else (self.pi_user, self.pi_password)
-                        resp = requests.post(
-                            batch_url,
-                            json=payload,
-                            auth=auth,
-                            verify=False,
-                            timeout=10
-                        )
+                        resp = requests.post(batch_url, json=payload, auth=auth, verify=False, timeout=10)
                         resp.raise_for_status()
                         items = resp.json().get('Items', [])
                         for item in items:
@@ -817,15 +819,13 @@ class PIInfluxWorker(QThread):
                             val_obj = item.get('Value', {})
                             raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
                             alias = alias_map.get(wid, wid)
-                            if raw is None:
-                                continue
+                            if raw is None: continue
                             try:
                                 val = float(raw)
                                 point.field(alias, val)
                                 self.live_data_update.emit(wid, val)
                                 if len(log_samples) < 3: log_samples.append(f"{alias}={val}")
                             except (ValueError, TypeError):
-                                logging.warning(f"Skipping PI field {alias} during batch write due to non-numeric value: {raw}")
                                 continue
 
                     write_api.write(
@@ -839,8 +839,7 @@ class PIInfluxWorker(QThread):
                     self.log_message.emit(f"PI Read Error: {e}")
 
                 for _ in range(int(self.interval_sec * 10)):
-                    if not self._is_running:
-                        break
+                    if not self._is_running: break
                     time.sleep(0.1)
 
         except Exception as e:
@@ -856,7 +855,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OPC UA Gateway - VERSION 3.0 (Stabilized)")
+        self.setWindowTitle("OPC UA to InfluxDB Gateway")
         if os.path.exists(ICON_FILE): self.setWindowIcon(QIcon(ICON_FILE))
         self.resize(1400, 900)
 
@@ -870,16 +869,15 @@ class MainWindow(QMainWindow):
         self.selected_opc_tags = self.selections.get("selected_opc_tags", {})
         self.output_tags = set(self.selections.get("output_tags", []))
         self.tag_metadata = self.selections.get("tag_metadata", {})
-        # Ensure all existing tags have a default type if missing
+        
         for nid in self.selected_opc_tags:
             if nid not in self.tag_metadata:
                 self.tag_metadata[nid] = {"type": "Float"}
         self.model_setpoints = {}
         self.csv_file_path = self.selections.get("csv_file_path")
         self.tag_item_map = {}
-        # PI tags: list of {webId, name, alias}
         self.pi_tags = self.selections.get("pi_tags", [])
-        self.pi_tag_item_map = {}  # webId -> QTreeWidgetItem
+        self.pi_tag_item_map = {}  
 
         self.cert_folder = pathlib.Path("./certificates")
         self.cert_folder.mkdir(exist_ok=True)
@@ -931,7 +929,7 @@ class MainWindow(QMainWindow):
         self.selections["pi_api_key"] = self.pi_api_key_input.text()
         self.selections["pi_tags"] = self.pi_tags
         self.selections["opc_browse_path"] = self.opc_browse_path_input.text()
-        self.selections["write_interval"] = self.write_interval_spinbox.value() # Save interval
+        self.selections["write_interval"] = self.write_interval_spinbox.value()
         try:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(self.selections, f, indent=4)
@@ -972,10 +970,8 @@ class MainWindow(QMainWindow):
         self.centralWidget().setWidgetResizable(True)
         layout = QHBoxLayout(central)
 
-        # Left Panel
         left = QVBoxLayout()
 
-        # 1. OPC
         g1 = QGroupBox("1. OPC UA Server Configuration")
         f1 = QFormLayout()
         self.opc_endpoint_input = QLineEdit(self.selections.get("opc_endpoint", "opc.tcp://localhost:4840"))
@@ -1008,7 +1004,6 @@ class MainWindow(QMainWindow):
         self.disconnect_opc_button = QPushButton("🔌 Disconnect")
         self.disconnect_opc_button.clicked.connect(self.disconnect_opc_server)
         self.disconnect_opc_button.setEnabled(False)
-        # Use the global config if available, otherwise fallback to local selections
         default_opc = getattr(config, "DB_MEASUREMENT_OPC", self.selections.get("opc_measurement", "kiln1_opc"))
         self.opc_measurement_input = QLineEdit(default_opc)
         f1.addRow("Measurement:", self.opc_measurement_input)
@@ -1020,7 +1015,6 @@ class MainWindow(QMainWindow):
         g1.setLayout(f1)
         left.addWidget(g1)
 
-        # 2. Influx
         g2 = QGroupBox("2. InfluxDB Configuration")
         f2 = QFormLayout()
         self.influx_url_input = QLineEdit(self.selections.get("influx_url", "http://localhost:8086"))
@@ -1038,7 +1032,7 @@ class MainWindow(QMainWindow):
         self.write_on_change_radio = QRadioButton("On Change")
         self.write_interval_spinbox = QSpinBox()
         self.write_interval_spinbox.setRange(100, 60000)
-        self.write_interval_spinbox.setValue(self.selections.get("write_interval", 1000)) # Load interval
+        self.write_interval_spinbox.setValue(self.selections.get("write_interval", 1000))
         self.write_per_sec_radio.setChecked(True)
         h2.addWidget(self.write_per_sec_radio)
         h2.addWidget(self.write_interval_spinbox)
@@ -1053,7 +1047,6 @@ class MainWindow(QMainWindow):
         g2.setLayout(f2)
         left.addWidget(g2)
 
-        # 3. Manual Write
         g3 = QGroupBox("3. Manual Write (Single Output)")
         f3 = QFormLayout()
         self.write_tag_combo = QComboBox()
@@ -1066,7 +1059,6 @@ class MainWindow(QMainWindow):
         g3.setLayout(f3)
         left.addWidget(g3)
 
-        # 4. Automated Write-Back
         g4 = QGroupBox("4. Automated Model Write-Back")
         v4 = QVBoxLayout()
         self.watcher_chk = QCheckBox("Enable Automated Write-Back")
@@ -1078,7 +1070,6 @@ class MainWindow(QMainWindow):
         g4.setLayout(v4)
         left.addWidget(g4)
 
-        # 5. Execution
         g5 = QGroupBox("5. Live Gateway Control")
         h5 = QHBoxLayout()
         self.start_gateway_button = QPushButton("▶ Start Live")
@@ -1091,7 +1082,6 @@ class MainWindow(QMainWindow):
         g5.setLayout(h5)
         left.addWidget(g5)
 
-        # 6. Simulator
         g6 = QGroupBox("6. Demo Simulator")
         v6 = QVBoxLayout()
         h6a = QHBoxLayout()
@@ -1116,7 +1106,6 @@ class MainWindow(QMainWindow):
         g6.setLayout(v6)
         left.addWidget(g6)
 
-        # 7. FastAPI Write Server
         g7 = QGroupBox("7. FastAPI Write Server")
         h7 = QHBoxLayout()
         self.api_port_input = QSpinBox()
@@ -1134,7 +1123,6 @@ class MainWindow(QMainWindow):
         g7.setLayout(h7)
         left.addWidget(g7)
 
-        # 8. OSI PI Configuration
         g8 = QGroupBox("8. OSI PI Server (PI Web API)")
         f8 = QFormLayout()
         self.pi_url_input = QLineEdit(self.selections.get("pi_url", "https://mypiserver/piwebapi"))
@@ -1147,7 +1135,6 @@ class MainWindow(QMainWindow):
         self.pi_use_api_key_chk.toggled.connect(self._toggle_pi_auth_mode)
 
         f8.addRow("PI Web API URL:", self.pi_url_input)
-        # Use the global config if available, otherwise fallback to local selections
         default_pi = getattr(config, "DB_MEASUREMENT_PI", self.selections.get("pi_measurement", "kiln1_pi"))
         self.pi_measurement_input = QLineEdit(default_pi)
         f8.addRow("Measurement:", self.pi_measurement_input)
@@ -1155,7 +1142,7 @@ class MainWindow(QMainWindow):
         f8.addRow("API Key:", self.pi_api_key_input)
         f8.addRow("Username:", self.pi_username_input)
         f8.addRow("Password:", self.pi_password_input)
-        self._toggle_pi_auth_mode() # Set initial state
+        self._toggle_pi_auth_mode()
 
         h8a = QHBoxLayout()
         self.pi_search_button = QPushButton("🔍 Search PI Tags...")
@@ -1199,7 +1186,6 @@ class MainWindow(QMainWindow):
         left.addStretch()
         layout.addLayout(left, 1)
 
-        # Right Panel
         right = QSplitter(Qt.Orientation.Vertical)
 
         g_tags = QGroupBox("OPC UA Tags to Monitor")
@@ -1235,7 +1221,6 @@ class MainWindow(QMainWindow):
         g_tags.setLayout(l_tags)
         right.addWidget(g_tags)
 
-        # PI Tags Panel
         g_pi_tags = QGroupBox("OSI PI Tags (PI \u2192 InfluxDB kiln1)")
         l_pi = QVBoxLayout()
         self.pi_tags_tree = QTreeWidget()
@@ -1355,7 +1340,6 @@ class MainWindow(QMainWindow):
         self._update_selected_tags_list_widget()
         self._update_write_combo()
 
-    # --- LOGIC HANDLERS ---
     def _update_cert_status_ui(self):
         if self.client_cert_path.exists() and self.client_key_path.exists():
             self.cert_status_label.setText("Certs: Ready")
@@ -1454,8 +1438,6 @@ class MainWindow(QMainWindow):
             dlg.tags_selected.connect(self._on_tags_selected)
             await dlg.populate_tree(self.opc_client, self.selected_opc_tags.keys(), self.opc_browse_path_input.text())
             
-            # Non-blocking async execution of the dialog
-            # Create a future to wait for the dialog to close
             done = asyncio.get_event_loop().create_future()
             dlg.finished.connect(lambda r: done.set_result(r) if not done.done() else None)
             dlg.show()
@@ -1473,7 +1455,6 @@ class MainWindow(QMainWindow):
         client_to_close = self.opc_client
         self.opc_client = None
 
-        # UI RESET
         self.connect_opc_button.setText("🌐 Connect & Browse")
         self.connect_opc_button.setEnabled(True)
         self.disconnect_opc_button.setText("🔌 Disconnect")
@@ -1485,7 +1466,6 @@ class MainWindow(QMainWindow):
         self.opc_client_connected.emit(False)
         self.status_bar.showMessage("Disconnected.", 2000)
 
-        # Network Cleanup
         if client_to_close:
             try:
                 await asyncio.wait_for(client_to_close.disconnect(), timeout=1.0)
@@ -1501,7 +1481,6 @@ class MainWindow(QMainWindow):
         self.disconnect_opc_button.setEnabled(connected)
         self.write_button.setEnabled(connected)
         
-        # Only enable 'Start' if connected AND not already running
         is_running = (self.opc_worker and self.opc_worker.isRunning()) or (self.simulator_worker and self.simulator_worker.isRunning())
         self.start_gateway_button.setEnabled(connected and not is_running)
         self._update_write_combo()
@@ -1510,7 +1489,7 @@ class MainWindow(QMainWindow):
         if not self.selected_opc_tags: return QMessageBox.warning(self, "No Tags", "Select tags first")
         self.start_gateway_button.setEnabled(False)
         self.stop_gateway_button.setEnabled(True)
-        self.start_simulator_button.setEnabled(False)  # Lock Simulator
+        self.start_simulator_button.setEnabled(False)
 
         conf = {'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
                 'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()}
@@ -1521,7 +1500,6 @@ class MainWindow(QMainWindow):
         self.opc_worker.log_message.connect(self.log_widget.appendPlainText)
         self.opc_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.opc_worker.live_data_update.connect(self._on_live_data_update)
-        # Reset UI when worker stops
         self.opc_worker.worker_finished.connect(self.stop_gateway)
         self.opc_worker.start()
 
@@ -1533,9 +1511,8 @@ class MainWindow(QMainWindow):
             self.opc_worker.stop()
             self.opc_worker = None
         self.start_gateway_button.setEnabled(self.opc_client is not None)
-        self.start_simulator_button.setEnabled(bool(self.csv_file_path))  # Unlock
+        self.start_simulator_button.setEnabled(bool(self.csv_file_path))
 
-    # --- PI GATEWAY METHODS ---
     def _toggle_pi_auth_mode(self):
         use_api = self.pi_use_api_key_chk.isChecked()
         self.pi_api_key_input.setEnabled(use_api)
@@ -1570,8 +1547,7 @@ class MainWindow(QMainWindow):
             self.pi_tag_item_map[t['webId']] = item
 
     def _edit_pi_tag_alias(self, item, column):
-        if column != 1:
-            return
+        if column != 1: return
         web_id = item.text(2)
         from PyQt6.QtWidgets import QInputDialog
         new_alias, ok = QInputDialog.getText(self, "Edit Alias", f"Alias for {item.text(0)}:", text=item.text(1))
@@ -1616,7 +1592,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Manually added WebID: {web_id}", 3000)
 
     def _paste_pi_stream_urls(self):
-        """Parse full PI Web API stream URLs and extract WebIDs automatically."""
         from PyQt6.QtWidgets import QDialog, QTextEdit, QDialogButtonBox, QVBoxLayout, QLabel
         import re
         dlg = QDialog(self)
@@ -1629,18 +1604,14 @@ class MainWindow(QMainWindow):
             "The WebID will be extracted automatically."
         ))
         text_edit = QTextEdit()
-        text_edit.setPlaceholderText("https://server/piwebapi/streams/F1Ab.../value")
         layout.addWidget(text_edit)
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+        if dlg.exec() != QDialog.DialogCode.Accepted: return
 
         raw_text = text_edit.toPlainText()
-        # Relaxed pattern to handle user's new format: http://.../API_KEY/SOU/data?path=...
-        # Also keeping the old stream pattern for compatibility
         stream_pattern = re.compile(r'https?://[^/]+/piwebapi/streams/([^/]+)/value', re.IGNORECASE)
         path_pattern = re.compile(r'https?://[^/]+/[^/]+/[^/]+/data\?path=(.+)', re.IGNORECASE)
         
@@ -1648,8 +1619,7 @@ class MainWindow(QMainWindow):
         added_count = 0
         for line in raw_text.splitlines():
             line = line.strip().lstrip(',').strip()
-            if not line:
-                continue
+            if not line: continue
             
             web_id = None
             full_url = line
@@ -1657,20 +1627,13 @@ class MainWindow(QMainWindow):
             m_stream = stream_pattern.search(line)
             m_path = path_pattern.search(line)
             
-            if m_stream:
-                web_id = m_stream.group(1)
-            elif m_path:
-                # Use the path parameter as a pseudo-WebID
-                web_id = m_path.group(1)
+            if m_stream: web_id = m_stream.group(1)
+            elif m_path: web_id = m_path.group(1)
             else:
-                # If it's a URL but doesn't match above, just use it as is if it looks like a URL
-                if line.startswith('http'):
-                    web_id = line
+                if line.startswith('http'): web_id = line
             
             if web_id and web_id not in existing_ids:
-                # Try to get a nicer name from path= or last part of URL
                 if m_path:
-                    # e.g. \\PTSOUPIAF01\Souselas\SOU\Coal Mill\Operation Data|Coal Mill 41 ON -> Coal Mill 41 ON
                     name = web_id.split('|')[-1] if '|' in web_id else web_id.split('\\')[-1]
                     name = requests.utils.unquote(name)
                 else:
@@ -1681,38 +1644,33 @@ class MainWindow(QMainWindow):
                 added_count += 1
 
         if added_count == 0:
-            QMessageBox.warning(self, "No URLs Found", "No valid PI stream URLs were detected. Make sure URLs contain '/piwebapi/streams/{WebID}/value'.")
+            QMessageBox.warning(self, "No URLs Found", "No valid PI stream URLs were detected.")
         else:
             self._refresh_pi_tags_tree()
             self._save_selections()
-            QMessageBox.information(self, "URLs Imported", f"Added {added_count} PI tags from stream URLs.\n\nDouble-click the Alias column to rename each tag.")
+            QMessageBox.information(self, "URLs Imported", f"Added {added_count} PI tags from stream URLs.")
 
     def _import_pi_tags_from_csv(self):
         f, _ = QFileDialog.getOpenFileName(self, "Import PI Tags CSV", "", "CSV (*.csv)")
-        if not f:
-            return
+        if not f: return
             
         try:
-            # Re-use the regex from pasting
             stream_pattern = re.compile(r'https?://[^/]+/piwebapi/streams/([^/]+)/value', re.IGNORECASE)
             path_pattern = re.compile(r'https?://[^/]+/[^/]+/[^/]+/data\?path=(.+)', re.IGNORECASE)
             
             with open(f, 'r', encoding='utf-8-sig') as file:
-                # Use Sniffer to detect dialtect and header
                 content = file.read(4096)
                 file.seek(0)
                 dialect = csv.Sniffer().sniff(content) if content else csv.excel
                 has_header = csv.Sniffer().has_header(content) if content else False
                 
                 reader = csv.reader(file, dialect)
-                if has_header:
-                    next(reader) # Skip header
+                if has_header: next(reader)
                 
                 added_count = 0
                 existing_ids = {t['webId'] for t in self.pi_tags}
                 
                 for row in reader:
-                    # Expecting: URL/WebID, Alias (optional), Name (optional)
                     if not row: continue
                     raw_url = row[0].strip()
                     if not raw_url: continue
@@ -1726,12 +1684,9 @@ class MainWindow(QMainWindow):
                     m_stream = stream_pattern.search(raw_url)
                     m_path = path_pattern.search(raw_url)
                     
-                    if m_stream:
-                        web_id = m_stream.group(1)
-                    elif m_path:
-                        web_id = m_path.group(1)
-                    else:
-                        web_id = raw_url # Fallback: assume it's a WebID or direct URL
+                    if m_stream: web_id = m_stream.group(1)
+                    elif m_path: web_id = m_path.group(1)
+                    else: web_id = raw_url 
                     
                     if web_id and web_id not in existing_ids:
                         if not name:
@@ -1741,13 +1696,10 @@ class MainWindow(QMainWindow):
                             else:
                                 name = f"Imported_{added_count + 1}"
                         
-                        if not alias:
-                            alias = name
+                        if not alias: alias = name
                             
                         self.pi_tags.append({
-                            'name': name, 
-                            'webId': web_id, 
-                            'alias': alias, 
+                            'name': name, 'webId': web_id, 'alias': alias, 
                             'stream_url': full_url if full_url.startswith('http') else None
                         })
                         existing_ids.add(web_id)
@@ -1766,38 +1718,28 @@ class MainWindow(QMainWindow):
                 with open(f, 'w', newline='') as file:
                     writer = csv.writer(file)
                     writer.writerow(["URL or WebID", "Alias (Influx Field Name)", "Tag Name (Display)"])
-                    writer.writerow(["http://ptliswinapp01:7000/KEY/SOU/data?path=\\\\SERVER\\PATH|TAG", "My_Tag_Alias", "Coal Mill 41 ON"])
-                    writer.writerow(["https://server/piwebapi/streams/F1Abc.../value", "Another_Tag", "Temperature"])
-                QMessageBox.information(self, "Success", "Template exported. You can fill this CSV and use 'Import CSV' to bulk load tags.")
+                QMessageBox.information(self, "Success", "Template exported.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export template: {e}")
 
     def start_pi_gateway(self):
-        if not self.pi_tags:
-            return QMessageBox.warning(self, "No PI Tags", "Add PI tags first using Search.")
+        if not self.pi_tags: return QMessageBox.warning(self, "No PI Tags", "Add PI tags first using Search.")
         self.start_pi_button.setEnabled(False)
         self.stop_pi_button.setEnabled(True)
         conf = {
-            'url': self.influx_url_input.text(),
-            'token': self.influx_token_input.text(),
-            'org': self.influx_org_input.text(),
-            'bucket': self.influx_bucket_input.text()
+            'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
+            'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()
         }
         self.pi_worker = PIInfluxWorker(
-            pi_url=self.pi_url_input.text(),
-            pi_user=self.pi_username_input.text(),
-            pi_password=self.pi_password_input.text(),
-            influx_config=conf,
-            pi_tags=list(self.pi_tags),
-            interval_sec=self.pi_interval_spin.value(),
-            use_api_key=self.pi_use_api_key_chk.isChecked(),
-            pi_api_key=self.pi_api_key_input.text(),
+            pi_url=self.pi_url_input.text(), pi_user=self.pi_username_input.text(),
+            pi_password=self.pi_password_input.text(), influx_config=conf,
+            pi_tags=list(self.pi_tags), interval_sec=self.pi_interval_spin.value(),
+            use_api_key=self.pi_use_api_key_chk.isChecked(), pi_api_key=self.pi_api_key_input.text(),
             db_measurement=self.pi_measurement_input.text()
         )
         self.pi_worker.log_message.connect(self.log_widget.appendPlainText)
         self.pi_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.pi_worker.live_data_update.connect(self._on_pi_live_update)
-        # Reset UI when worker stops
         self.pi_worker.worker_finished.connect(self.stop_pi_gateway)
         self.pi_worker.start()
 
@@ -1813,13 +1755,12 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, object)
     def _on_pi_live_update(self, web_id, value):
         item = self.pi_tag_item_map.get(web_id)
-        if item:
-            item.setText(3, f"{value:.3f}" if isinstance(value, float) else str(value))
+        if item: item.setText(3, f"{value:.3f}" if isinstance(value, float) else str(value))
 
     def start_simulator(self):
         self.start_simulator_button.setEnabled(False)
         self.stop_simulator_button.setEnabled(True)
-        self.connect_opc_button.setEnabled(False)  # Lock OPC
+        self.connect_opc_button.setEnabled(False) 
 
         conf = {'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
                 'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()}
@@ -1827,7 +1768,6 @@ class MainWindow(QMainWindow):
         self.simulator_worker.log_message.connect(self.log_widget.appendPlainText)
         self.simulator_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.simulator_worker.live_data_update.connect(self._on_live_data_update)
-        # Reset UI when worker stops
         self.simulator_worker.worker_finished.connect(self.stop_simulator)
         self.simulator_worker.start()
 
@@ -1839,17 +1779,15 @@ class MainWindow(QMainWindow):
             self.simulator_worker.stop()
             self.simulator_worker = None
         self.start_simulator_button.setEnabled(bool(self.csv_file_path))
-        self.connect_opc_button.setEnabled(self.opc_client is None)  # Unlock
+        self.connect_opc_button.setEnabled(self.opc_client is None) 
 
     def toggle_write_watcher(self, checked):
         if checked:
             if not self.model_setpoints: return self.watcher_chk.setChecked(False)
             conf = self._get_opc_config()
             influx_conf = {
-                'url': self.influx_url_input.text(),
-                'token': self.influx_token_input.text(),
-                'org': self.influx_org_input.text(),
-                'bucket': self.influx_bucket_input.text()
+                'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
+                'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()
             }
             wb_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2') if config is not None else 'kiln2'
             self.log_widget.appendPlainText(f"Starting Setpoint Watcher using measurement: {wb_meas}")
@@ -1896,7 +1834,6 @@ class MainWindow(QMainWindow):
         finally:
             self.influx_test_button.setEnabled(True)
 
-    # --- TAG LIST UTILS ---
     @pyqtSlot(dict)
     def _on_tags_selected(self, tags):
         for nid, name in tags.items():
@@ -1912,7 +1849,6 @@ class MainWindow(QMainWindow):
         self.tag_item_map.clear()
         self.pi_tag_item_map.clear()
 
-        # 1. OPC Tags
         for nid, name in self.selected_opc_tags.items():
             mode_str = "[OUTPUT]" if nid in self.output_tags else "[INPUT]"
             meta = self.tag_metadata.get(nid, {"type": "Float"})
@@ -1928,7 +1864,6 @@ class MainWindow(QMainWindow):
             self.tag_item_map[nid] = item
             if nid in self.output_tags: self.write_tag_combo.addItem(f"{name} ({nid})", userData=nid)
 
-        # 2. PI Tags
         for tag in self.pi_tags:
             wid = tag.get('webId', '')
             name = tag.get('name', 'Unknown')
@@ -1936,7 +1871,7 @@ class MainWindow(QMainWindow):
             
             item = QTreeWidgetItem([alias, wid, "[PI-IN]", "[Float]", "---"])
             item.setData(1, Qt.ItemDataRole.UserRole, wid)
-            item.setForeground(2, QColor("#a6e3a1")) # Green for PI
+            item.setForeground(2, QColor("#a6e3a1"))
             self.selected_tags_tree.addTopLevelItem(item)
             self.pi_tag_item_map[wid] = item
 
@@ -1946,12 +1881,12 @@ class MainWindow(QMainWindow):
         nid = item.data(1, Qt.ItemDataRole.UserRole)
         if not nid: return
         
-        if column == 2: # Toggle Mode
+        if column == 2:
             if nid in self.output_tags: self.output_tags.remove(nid)
             else: self.output_tags.add(nid)
             self._update_selected_tags_list_widget()
             self._save_selections()
-        elif column == 3: # Cycle Type
+        elif column == 3:
             types = ["Float", "String", "Bool"]
             curr = self.tag_metadata.get(nid, {"type": "Float"}).get("type", "Float")
             next_type = types[(types.index(curr) + 1) % len(types)]
@@ -1961,34 +1896,25 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, object)
     def _on_live_data_update(self, nodeid, value):
-        # Try both OPC and PI maps
         item = self.tag_item_map.get(nodeid) or self.pi_tag_item_map.get(nodeid)
         if item:
-            self.log_widget.appendPlainText(f"DEBUG UI: Update {nodeid} -> {value}")
             if isinstance(value, float):
                 val_str = f"{value:.3f}"
             else:
                 val_str = str(value)
             item.setText(4, val_str)
-        else:
-            # self.log_widget.appendPlainText(f"DEBUG UI: Ignored {nodeid}")
-            pass
 
     def _on_tag_name_changed(self, item, column):
-        """Called when user double-clicks and edits a tag name cell."""
-        if column != 0:
-            return  # only care about Tag Name column
+        if column != 0: return
         nid = item.data(1, Qt.ItemDataRole.UserRole)
-        if not nid:
-            return
+        if not nid: return
         new_name = item.text(0).strip()
         if not new_name:
-            # Revert to old name if blank
             item.setText(0, self.selected_opc_tags.get(nid, nid))
             return
         self.selected_opc_tags[nid] = new_name
         self._save_selections()
-        self.status_bar.showMessage(f"✏️ Renamed → '{new_name}' (InfluxDB field name updated)", 3000)
+        self.status_bar.showMessage(f"✏️ Renamed → '{new_name}'", 3000)
 
     def _update_write_combo(self):
         has_output = self.write_tag_combo.count() > 0
@@ -2023,8 +1949,7 @@ class MainWindow(QMainWindow):
 
     def _import_tags_from_csv(self):
         f, _ = QFileDialog.getOpenFileName(self, "Import OPC Tags CSV", "", "CSV (*.csv)")
-        if not f:
-            return
+        if not f: return
         try:
             with open(f, 'r', encoding='utf-8-sig') as file:
                 content = file.read(4096)
@@ -2033,8 +1958,7 @@ class MainWindow(QMainWindow):
                 has_header = csv.Sniffer().has_header(content) if content else False
                 
                 reader = csv.reader(file, dialect)
-                if has_header:
-                    next(reader) # Skip header
+                if has_header: next(reader)
                 
                 added_count = 0
                 for row in reader:
@@ -2103,8 +2027,6 @@ class MainWindow(QMainWindow):
         self.start_api_button.setEnabled(True)
 
     def closeEvent(self, e):
-        # Systematic shutdown of all workers and forceful process termination
-        # to prevent background zombie processes on Windows.
         try:
             if self.opc_worker: self.opc_worker.stop()
             if self.pi_worker: self.pi_worker.stop()
@@ -2112,21 +2034,17 @@ class MainWindow(QMainWindow):
             if self.watcher_worker: self.watcher_worker.stop()
             if hasattr(self, 'api_worker') and self.api_worker: self.api_worker.stop()
             
-            # Briefly wait for workers to cleanup resources (e.g. InfluxDB final writes)
             workers = [self.opc_worker, self.pi_worker, self.simulator_worker, self.watcher_worker]
             if hasattr(self, 'api_worker'): workers.append(self.api_worker)
             
             for w in workers:
-                if w and w.isRunning():
-                    w.wait(200) # 200ms grace period per worker
+                if w and w.isRunning(): w.wait(200)
             
             self._save_selections()
         except Exception as ex:
             logging.error(f"Error during shutdown: {ex}")
             
         e.accept()
-        # Forceful exit - this ensures all threads (daemon or not) are killed instantly.
-        # This is the only way to ensure 100% cleanup if library threads are hanging.
         os._exit(0)
 
 
