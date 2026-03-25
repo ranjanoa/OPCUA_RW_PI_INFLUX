@@ -1,7 +1,7 @@
 import sys
 import os
 import asyncio
-# VERSION 2.0 (Stabilized)
+# VERSION 3.0 (Stabilized)
 import logging
 import json
 import csv
@@ -322,7 +322,7 @@ class OPCInfluxWorker(QThread):
                             tag_name = self.selected_tags.get(nid, nid)
                             meta = self.tag_metadata.get(nid, {"type": "Float"})
                             expected_type = meta.get("type", "Float")
-
+                            # VERSION 3.0 ULTRA-SILENT NULL CHECK
                             if val is None or str(type(val)) == "<class 'NoneType'>":
                                 continue  # SILENT skip for nulls (patched for type-mismatch)
 
@@ -335,8 +335,8 @@ class OPCInfluxWorker(QThread):
                                 else: # Float
                                     final_val = float(val)
                             except (ValueError, TypeError):
-                                # Skip field if type mismatch to prevent InfluxDB 422 errors
-                                logging.warning(f"Skipping {tag_name} due to type mismatch (Expected {expected_type}, Got {type(val)})")
+                                # Skip
+                                logging.warning(f"[V3.0] Skipping {tag_name} due to type mismatch (Expected {expected_type}, Got {type(val)})")
                                 continue
 
                             if expected_type == "Float":
@@ -856,7 +856,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OPC UA to InfluxDB Gateway")
+        self.setWindowTitle("OPC UA Gateway - VERSION 3.0 (Stabilized)")
         if os.path.exists(ICON_FILE): self.setWindowIcon(QIcon(ICON_FILE))
         self.resize(1400, 900)
 
