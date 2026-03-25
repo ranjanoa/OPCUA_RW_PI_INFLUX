@@ -1,6 +1,7 @@
 import sys
 import os
 import asyncio
+# VERSION 2.0 (Stabilized)
 import logging
 import json
 import csv
@@ -322,8 +323,8 @@ class OPCInfluxWorker(QThread):
                             meta = self.tag_metadata.get(nid, {"type": "Float"})
                             expected_type = meta.get("type", "Float")
 
-                            if val is None:
-                                continue  # Silent skip for nulls
+                            if val is None or str(type(val)) == "<class 'NoneType'>":
+                                continue  # SILENT skip for nulls (patched for type-mismatch)
 
                             final_val = None
                             try:
