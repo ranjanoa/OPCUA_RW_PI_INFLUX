@@ -353,6 +353,8 @@ class OPCInfluxWorker(QThread):
                                 point.field(tag_name, final_val)
                                 self.live_data_update.emit(nid, final_val)
                                 if len(log_samples) < 3: log_samples.append(f"{tag_name}={final_val}")
+                                # Temporary Trace Log
+                                self.log_message.emit(f"DEBUG Trace: {tag_name} = {final_val}")
 
                         write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
                         self.data_written.emit(f"✅ Live: {', '.join(log_samples)} ({len(log_samples)} fields)")
@@ -1961,11 +1963,15 @@ class MainWindow(QMainWindow):
         # Try both OPC and PI maps
         item = self.tag_item_map.get(nodeid) or self.pi_tag_item_map.get(nodeid)
         if item:
+            self.log_widget.appendPlainText(f"DEBUG UI: Update {nodeid} -> {value}")
             if isinstance(value, float):
                 val_str = f"{value:.3f}"
             else:
                 val_str = str(value)
             item.setText(4, val_str)
+        else:
+            # self.log_widget.appendPlainText(f"DEBUG UI: Ignored {nodeid}")
+            pass
 
     def _on_tag_name_changed(self, item, column):
         """Called when user double-clicks and edits a tag name cell."""
