@@ -1,4 +1,4 @@
-asyncua==0.9.98
+asyncua>=1.1.8
 influxdb-client>=1.38.0
 PyQt6>=6.5.0
 qasync>=0.27.0
