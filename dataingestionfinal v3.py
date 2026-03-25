@@ -322,6 +322,9 @@ class OPCInfluxWorker(QThread):
                             meta = self.tag_metadata.get(nid, {"type": "Float"})
                             expected_type = meta.get("type", "Float")
 
+                            if val is None:
+                                continue  # Silent skip for nulls
+
                             final_val = None
                             try:
                                 if expected_type == "String":
@@ -329,11 +332,7 @@ class OPCInfluxWorker(QThread):
                                 elif expected_type == "Bool":
                                     final_val = bool(val)
                                 else: # Float
-                                    if isinstance(val, (int, float, bool)):
-                                        final_val = float(val)
-                                    else:
-                                        # Attempt conversion or skip
-                                        final_val = float(val)
+                                    final_val = float(val)
                             except (ValueError, TypeError):
                                 # Skip field if type mismatch to prevent InfluxDB 422 errors
                                 logging.warning(f"Skipping {tag_name} due to type mismatch (Expected {expected_type}, Got {type(val)})")
@@ -783,6 +782,8 @@ class PIInfluxWorker(QThread):
                                     # Fallback for standard PI Web API formats
                                     val_obj = data.get('Value', data)
                                     raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
+                                if raw is None:
+                                    continue
                                 try:
                                     val = float(raw)
                                     point.field(alias, val)
@@ -812,6 +813,8 @@ class PIInfluxWorker(QThread):
                             val_obj = item.get('Value', {})
                             raw = val_obj.get('Value', val_obj) if isinstance(val_obj, dict) else val_obj
                             alias = alias_map.get(wid, wid)
+                            if raw is None:
+                                continue
                             try:
                                 val = float(raw)
                                 point.field(alias, val)
