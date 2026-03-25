@@ -1493,7 +1493,10 @@ class MainWindow(QMainWindow):
         self.connect_opc_button.setEnabled(not connected)
         self.disconnect_opc_button.setEnabled(connected)
         self.write_button.setEnabled(connected)
-        self.start_gateway_button.setEnabled(connected)
+        
+        # Only enable 'Start' if connected AND not already running
+        is_running = (self.opc_worker and self.opc_worker.isRunning()) or (self.simulator_worker and self.simulator_worker.isRunning())
+        self.start_gateway_button.setEnabled(connected and not is_running)
         self._update_write_combo()
 
     def start_gateway(self):
@@ -1511,12 +1514,18 @@ class MainWindow(QMainWindow):
         self.opc_worker.log_message.connect(self.log_widget.appendPlainText)
         self.opc_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.opc_worker.live_data_update.connect(self._on_live_data_update)
+        # Reset UI when worker stops
+        self.opc_worker.worker_finished.connect(self.stop_gateway)
         self.opc_worker.start()
 
     def stop_gateway(self):
         self.stop_gateway_button.setEnabled(False)
-        if self.opc_worker: self.opc_worker.stop()
-        self.start_gateway_button.setEnabled(True)
+        if self.opc_worker: 
+            try: self.opc_worker.log_message.disconnect() 
+            except: pass
+            self.opc_worker.stop()
+            self.opc_worker = None
+        self.start_gateway_button.setEnabled(self.opc_client is not None)
         self.start_simulator_button.setEnabled(bool(self.csv_file_path))  # Unlock
 
     # --- PI GATEWAY METHODS ---
@@ -1781,11 +1790,15 @@ class MainWindow(QMainWindow):
         self.pi_worker.log_message.connect(self.log_widget.appendPlainText)
         self.pi_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.pi_worker.live_data_update.connect(self._on_pi_live_update)
+        # Reset UI when worker stops
+        self.pi_worker.worker_finished.connect(self.stop_pi_gateway)
         self.pi_worker.start()
 
     def stop_pi_gateway(self):
         self.stop_pi_button.setEnabled(False)
         if self.pi_worker:
+            try: self.pi_worker.log_message.disconnect()
+            except: pass
             self.pi_worker.stop()
             self.pi_worker = None
         self.start_pi_button.setEnabled(True)
@@ -1807,13 +1820,19 @@ class MainWindow(QMainWindow):
         self.simulator_worker.log_message.connect(self.log_widget.appendPlainText)
         self.simulator_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
         self.simulator_worker.live_data_update.connect(self._on_live_data_update)
+        # Reset UI when worker stops
+        self.simulator_worker.worker_finished.connect(self.stop_simulator)
         self.simulator_worker.start()
 
     def stop_simulator(self):
         self.stop_simulator_button.setEnabled(False)
-        if self.simulator_worker: self.simulator_worker.stop()
-        self.start_simulator_button.setEnabled(True)
-        self.connect_opc_button.setEnabled(True)  # Unlock
+        if self.simulator_worker: 
+            try: self.simulator_worker.log_message.disconnect()
+            except: pass
+            self.simulator_worker.stop()
+            self.simulator_worker = None
+        self.start_simulator_button.setEnabled(bool(self.csv_file_path))
+        self.connect_opc_button.setEnabled(self.opc_client is None)  # Unlock
 
     def toggle_write_watcher(self, checked):
         if checked:
