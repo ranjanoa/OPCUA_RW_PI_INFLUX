@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QDialog, QTreeWidget, QTreeWidgetItem, QMessageBox, QStatusBar,
     QTextBrowser, QComboBox, QCheckBox, QDialogButtonBox, QFormLayout,
     QRadioButton, QSpinBox, QTreeWidgetItemIterator, QAbstractItemView,
-    QMenu, QScrollArea
+    QMenu, QScrollArea, QTabWidget, QTabBar
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, pyqtSlot
 from PyQt6.QtGui import QIcon, QColor, QAction
