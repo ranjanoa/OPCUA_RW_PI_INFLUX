@@ -1015,11 +1015,16 @@ class MainWindow(QMainWindow):
                 matched_nid = None
                 
                 # --- Advanced Matching Strategy ---
+                # 0. DIRECT NODEID MATCH: If the tag_name itself looks like a NodeID, use it!
+                if "ns=" in target_name_clean or target_name_clean.startswith("i="):
+                    matched_nid = str(target_name).strip()
+                
                 # 1. Exact Match against OPC Display Names in the current tree
-                for nid, opc_name in self.selected_opc_tags.items():
-                    if opc_name == target_name:
-                        matched_nid = nid
-                        break
+                if not matched_nid:
+                    for nid, opc_name in self.selected_opc_tags.items():
+                        if opc_name == target_name:
+                            matched_nid = nid
+                            break
                 
                 # 2. Case-Insensitive Match
                 if not matched_nid:
@@ -1152,6 +1157,11 @@ class MainWindow(QMainWindow):
 
         g4 = QGroupBox("4. Automated Model Write-Back")
         v4 = QVBoxLayout()
+        f4 = QFormLayout()
+        self.watcher_meas_input = QLineEdit(self.selections.get("watcher_meas", "kiln2"))
+        f4.addRow("Source Measurement:", self.watcher_meas_input)
+        v4.addLayout(f4)
+        
         self.watcher_chk = QCheckBox("Enable Automated Write-Back")
         self.watcher_chk.setEnabled(True)
         self.watcher_chk.toggled.connect(self.toggle_write_watcher)
@@ -1995,7 +2005,7 @@ class MainWindow(QMainWindow):
                 'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
                 'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()
             }
-            wb_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2') if config is not None else 'kiln2'
+            wb_meas = self.watcher_meas_input.text() or "kiln2"
             self.log_widget.appendPlainText(f"Starting Setpoint Watcher using measurement: {wb_meas}")
             self.watcher_worker = SetpointWatcherWorker(conf, influx_conf, self.model_setpoints, db_measurement=wb_meas)
             self.watcher_worker.log_msg.connect(self.log_widget.appendPlainText)
