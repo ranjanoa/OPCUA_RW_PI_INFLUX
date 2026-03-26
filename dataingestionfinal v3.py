@@ -965,47 +965,93 @@ class MainWindow(QMainWindow):
 
     def _parse_model_json(self, path):
         try:
-            with open(path, 'r') as f: data = json.load(f)
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
             self.model_setpoints = {}
+            self.output_tags.clear()
             
-            # Support both "control_variables" and a top-level dict if that's what's provided
-            vars_dict = data.get("control_variables", data if isinstance(data, dict) else {})
+            # --- Identify the internal list/dict of variables ---
+            # 1. Check for "control_variables" key
+            # 2. Check if the top-level is a list
+            # 3. Fallback to top-level dict
+            if isinstance(data, dict) and "control_variables" in data:
+                vars_source = data["control_variables"]
+            elif isinstance(data, list):
+                vars_source = data
+            elif isinstance(data, dict):
+                vars_source = data
+            else:
+                vars_source = {}
+
+            # Convert to list of (key, value) for uniform processing
+            if isinstance(vars_source, dict):
+                items_to_process = vars_source.items()
+            else:
+                # If it's a list, we generate dummy keys for internal tracking
+                items_to_process = [(f"Item_{i}", v) for i, v in enumerate(vars_source)]
+
+            self.log_widget.appendPlainText(f"🔍 Analyzing JSON setpoints from {os.path.basename(path)}...")
             
-            for k, v in vars_dict.items():
+            potential_setpoints_count = 0
+            for k, v in items_to_process:
                 if not isinstance(v, dict): continue
                 
-                # Check for setpoint flag (case-insensitive-ish)
-                is_sp = v.get("is_setpoint") or v.get("isSetPoint")
-                if is_sp:
-                    # Check for tag name in multiple possible keys
-                    target_name = v.get("tag_name") or v.get("VariableName") or v.get("property_name")
-                    if not target_name:
-                        self.log_widget.appendPlainText(f"⚠️ Skipping '{k}': No 'tag_name' or 'VariableName' found in JSON.")
-                        continue
-                        
-                    matched_nid = None
-                    # Try exact match first
+                # Check for setpoint flag (more keys: is_setpoint, isSetPoint, setpoint, SetPoint, is_output)
+                is_sp = any(v.get(key) for key in ["is_setpoint", "isSetPoint", "setpoint", "SetPoint", "is_output"])
+                
+                if not is_sp:
+                    continue
+                
+                potential_setpoints_count += 1
+                # Check for tag name in multiple possible keys
+                target_name = v.get("tag_name") or v.get("VariableName") or v.get("property_name") or v.get("Tag") or v.get("name")
+                
+                if not target_name:
+                    self.log_widget.appendPlainText(f"   ⚠️ Skipping '{k}': Found setpoint flag but no 'tag_name' or 'VariableName' field.")
+                    continue
+                
+                target_name_clean = str(target_name).strip().lower()
+                matched_nid = None
+                
+                # --- Advanced Matching Strategy ---
+                # 1. Exact Match against OPC Display Names in the current tree
+                for nid, opc_name in self.selected_opc_tags.items():
+                    if opc_name == target_name:
+                        matched_nid = nid
+                        break
+                
+                # 2. Case-Insensitive Match
+                if not matched_nid:
                     for nid, opc_name in self.selected_opc_tags.items():
-                        if opc_name == target_name:
+                        if str(opc_name).strip().lower() == target_name_clean:
                             matched_nid = nid
                             break
-                    
-                    # Fallback: Tag ID might be the name if not mapped? (Unlikely but safe)
-                    if not matched_nid:
-                        if target_name in self.selected_opc_tags:
-                            matched_nid = target_name
-                    
-                    if matched_nid:
-                        self.model_setpoints[k] = matched_nid
-                        self.output_tags.add(matched_nid)
-                    else:
-                        self.log_widget.appendPlainText(f"⚠️ Warning: Model requires '{target_name}' but it is not mapped to an OPC Tag.")
+                
+                # 3. Match against Node ID directly (strip 'ns=...;s=' part for flexible matching)
+                if not matched_nid:
+                    for nid in self.selected_opc_tags.keys():
+                        if nid == target_name or nid.split('=')[-1] == target_name:
+                            matched_nid = nid
+                            break
+
+                if matched_nid:
+                    self.model_setpoints[k] = matched_nid
+                    self.output_tags.add(matched_nid)
+                    # self.log_widget.appendPlainText(f"   ✅ Mapped '{k}' -> {target_name}")
+                else:
+                    self.log_widget.appendPlainText(f"   ❌ Match Failed: '{target_name}' not found in your Monitored Tags list.")
 
             count = len(self.model_setpoints)
             self.status_bar.showMessage(f"Loaded {count} setpoints", 4000)
-            self.log_widget.appendPlainText(f"✅ Loaded {count} setpoints from {os.path.basename(path)}")
-            self.watcher_chk.setEnabled(True)
-            self.watcher_chk.setText(f"Enable Automated Write-Back ({count} mapped tags)")
+            self.log_widget.appendPlainText(f"🏁 Summary: Found {potential_setpoints_count} setpoints, successfully mapped {count} to OPC UA tags.")
+            
+            if count > 0:
+                self.watcher_chk.setEnabled(True)
+                self.watcher_chk.setText(f"Enable Automated Write-Back ({count} mapped tags)")
+            else:
+                self.log_widget.appendPlainText("💡 Tip: Setpoints must match the 'Tag Name' column in your OPC UA Tags list.")
+            
             self._update_selected_tags_list_widget()
         except Exception as e:
             self.log_widget.appendPlainText(f"❌ JSON Import Error: {e}")
