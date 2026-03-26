@@ -1827,6 +1827,25 @@ class MainWindow(QMainWindow):
         self.start_simulator_button.setEnabled(bool(self.csv_file_path))
         self.connect_opc_button.setEnabled(self.opc_client is None) 
 
+    def _update_selected_tags_list_widget(self):
+        self.selected_tags_tree.clear()
+        self.tag_item_map.clear()
+        self.write_tag_combo.clear()
+
+        for nid, name in self.selected_opc_tags.items():
+            mode = "Output" if nid in self.output_tags else "Input"
+            dtype = self.tag_metadata.get(nid, {"type": "Float"}).get("type", "Float")
+            
+            item = QTreeWidgetItem([name, nid, mode, dtype, "---"])
+            item.setData(1, Qt.ItemDataRole.UserRole, nid)
+            self.selected_tags_tree.addTopLevelItem(item)
+            self.tag_item_map[nid] = item
+            
+            if mode == "Output":
+                self.write_tag_combo.addItem(f"{name} ({nid})", nid)
+        
+        self._update_write_combo()
+
     @pyqtSlot(dict)
     def _on_tags_selected(self, tags):
         for nid, name in tags.items():
