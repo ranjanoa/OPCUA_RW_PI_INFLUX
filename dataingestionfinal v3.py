@@ -1744,6 +1744,115 @@ class MainWindow(QMainWindow):
             self.pi_worker = None
         self.start_pi_button.setEnabled(True)
 
+    @qasync.asyncSlot()
+    async def test_influxdb_connection(self):
+        self.influx_test_button.setEnabled(False)
+        self.influx_connection_status_label.setText("Status: Testing...")
+        self.influx_connection_status_label.setStyleSheet("color: #ffcc00;")
+        try:
+            c = InfluxDBClient(url=self.influx_url_input.text(), token=self.influx_token_input.text(),
+                               org=self.influx_org_input.text(), timeout=3000)
+            
+            # This prevents the UI from freezing if the ping takes a long time!
+            is_connected = await asyncio.to_thread(c.ping)
+            
+            if is_connected:
+                self.influx_connection_status_label.setText("Status: Connected")
+                self.influx_connection_status_label.setStyleSheet("color: #4caf50;")
+            else:
+                raise Exception("Ping Failed")
+        except Exception as e:
+            self.influx_connection_status_label.setText("Status: Failed")
+            self.influx_connection_status_label.setStyleSheet("color: #f44336;")
+        finally:
+            self.influx_test_button.setEnabled(True)
+
+    @qasync.asyncSlot()
+    async def _on_write_button_clicked(self):
+        nid = self.write_tag_combo.currentData()
+        val = self.write_value_input.text()
+        if not nid or not val: return
+
+        self.write_button.setEnabled(False)
+        try:
+            node = self.opc_client.get_node(nid)
+            await node.write_value(float(val))
+            QMessageBox.information(self, "Success", f"Wrote {val}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+        finally:
+            self.write_button.setEnabled(True)
+
+    def toggle_write_watcher(self, checked):
+        if checked:
+            if not self.model_setpoints: return self.watcher_chk.setChecked(False)
+            conf = self._get_opc_config()
+            influx_conf = {
+                'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
+                'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()
+            }
+            wb_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2') if config is not None else 'kiln2'
+            self.log_widget.appendPlainText(f"Starting Setpoint Watcher using measurement: {wb_meas}")
+            self.watcher_worker = SetpointWatcherWorker(conf, influx_conf, self.model_setpoints, db_measurement=wb_meas)
+            self.watcher_worker.log_msg.connect(self.log_widget.appendPlainText)
+            self.watcher_worker.start()
+            self.watcher_status.setText("Status: Running")
+            self.watcher_status.setStyleSheet("color: #4caf50;")
+        else:
+            if self.watcher_worker: self.watcher_worker.stop()
+            self.watcher_status.setText("Status: Stopped")
+            self.watcher_status.setStyleSheet("")
+
+    def start_simulator(self):
+        self.start_simulator_button.setEnabled(False)
+        self.stop_simulator_button.setEnabled(True)
+        self.connect_opc_button.setEnabled(False) 
+
+        conf = {'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
+                'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()}
+        self.simulator_worker = SimulatorWorker(conf, self.csv_file_path, db_measurement=self.opc_measurement_input.text())
+        self.simulator_worker.log_message.connect(self.log_widget.appendPlainText)
+        self.simulator_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
+        self.simulator_worker.live_data_update.connect(self._on_live_data_update)
+        self.simulator_worker.worker_finished.connect(self.stop_simulator)
+        self.simulator_worker.start()
+
+    def stop_simulator(self):
+        self.stop_simulator_button.setEnabled(False)
+        if self.simulator_worker: 
+            try: self.simulator_worker.log_message.disconnect()
+            except: pass
+            self.simulator_worker.stop()
+            self.simulator_worker = None
+        self.start_simulator_button.setEnabled(bool(self.csv_file_path))
+        self.connect_opc_button.setEnabled(self.opc_client is None) 
+
+    @pyqtSlot(dict)
+    def _on_tags_selected(self, tags):
+        for nid, name in tags.items():
+            self.selected_opc_tags[nid] = name
+            if nid not in self.tag_metadata:
+                self.tag_metadata[nid] = {"type": "Float"}
+        self._update_selected_tags_list_widget()
+        self._save_selections()
+
+    def _on_tag_item_clicked(self, item, column):
+        nid = item.data(1, Qt.ItemDataRole.UserRole)
+        if not nid: return
+        
+        if column == 2:
+            if nid in self.output_tags: self.output_tags.remove(nid)
+            else: self.output_tags.add(nid)
+            self._update_selected_tags_list_widget()
+            self._save_selections()
+        elif column == 3:
+            types = ["Float", "String", "Bool"]
+            curr = self.tag_metadata.get(nid, {"type": "Float"}).get("type", "Float")
+            next_type = types[(types.index(curr) + 1) % len(types)]
+            self.tag_metadata[nid] = {"type": next_type}
+            self._update_selected_tags_list_widget()
+            self._save_selections()
+
     @pyqtSlot(dict)
     def _on_live_data_update(self, updates_dict):
         # Only updates the OPC UA window
