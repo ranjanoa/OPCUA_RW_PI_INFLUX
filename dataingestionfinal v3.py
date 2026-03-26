@@ -936,7 +936,6 @@ class MainWindow(QMainWindow):
             for k, v in data.get("control_variables", {}).items():
                 if v.get("is_setpoint"):
                     target_name = v.get("tag_name")
-                    self.output_tags.add(target_name)
                     matched_nid = None
                     for nid, opc_name in self.selected_opc_tags.items():
                         if opc_name == target_name:
@@ -945,6 +944,7 @@ class MainWindow(QMainWindow):
                     
                     if matched_nid:
                         self.model_setpoints[k] = matched_nid
+                        self.output_tags.add(matched_nid)
                     else:
                         self.log_widget.appendPlainText(f"⚠️ Warning: Model requires '{target_name}' but it is not mapped to a Node ID.")
 
