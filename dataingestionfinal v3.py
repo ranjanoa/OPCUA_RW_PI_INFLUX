@@ -1,7 +1,7 @@
 import sys
 import os
 import asyncio
-# VERSION 3.0 (Subscription-Based OPC UA + Queue Batching)
+# VERSION 4.2 (Complete, Un-truncated, Fully Integrated)
 import logging
 import json
 import csv
@@ -30,7 +30,7 @@ from asyncua.crypto.security_policies import (
     SecurityPolicyBasic256Sha256
 )
 from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
 
 from cryptography.hazmat.backends import default_backend
 from cryptography import x509
@@ -262,19 +262,15 @@ class ServerBrowseDialog(QDialog):
 
 
 # --- WORKER: OPC UA -> INFLUXDB (SUBSCRIPTION MODE) ---
-
 class OPCSubscriptionHandler:
     """Handles incoming data change events from the OPC UA Server"""
     def __init__(self, worker):
         self.worker = worker
 
     def datachange_notification(self, node, val, data):
-        # Triggered automatically by the server when a tag changes
         nid = node.nodeid.to_string()
         status = data.monitored_item.Value.StatusCode
         timestamp = datetime.now(timezone.utc)
-        
-        # Put the new data into the worker's processing queue
         self.worker.data_queue.put_nowait((nid, val, status, timestamp))
 
 
@@ -283,7 +279,7 @@ class OPCInfluxWorker(QThread):
     connection_status = pyqtSignal(bool)
     worker_finished = pyqtSignal()
     data_written = pyqtSignal(str)
-    live_data_update = pyqtSignal(str, object)
+    live_data_update = pyqtSignal(dict) 
 
     def __init__(self, opc_config, influx_config, selected_tags, write_mode, interval_ms, tag_metadata=None, db_measurement='kiln1'):
         super().__init__()
@@ -293,7 +289,7 @@ class OPCInfluxWorker(QThread):
         self.selected_tags = selected_tags
         self.selected_tags_nodeids = list(selected_tags.keys())
         self.tag_metadata = tag_metadata or {}
-        self.interval_ms = max(interval_ms, 100) # Minimum 100ms
+        self.interval_ms = int(max(interval_ms, 250)) 
         self._is_running = True
         
         self.value_history = {}
@@ -308,46 +304,49 @@ class OPCInfluxWorker(QThread):
         client = Client(url=self.opc_config['url'])
         await setup_opc_security(client, self.opc_config)
         
-        influx = InfluxDBClient(url=self.influx_config['url'], token=self.influx_config['token'], org=self.influx_config['org'])
-        write_api = influx.write_api(write_options=SYNCHRONOUS)
+        influx = InfluxDBClient(url=self.influx_config['url'], token=self.influx_config['token'], org=self.influx_config['org'], timeout=5000)
+        write_api = influx.write_api(write_options=ASYNCHRONOUS) 
         
         reconnect_delay = 5.0
         while self._is_running:
             try:
                 self.log_message.emit(f"Connecting to {self.opc_config['url']}...")
                 await asyncio.wait_for(client.connect(), timeout=10.0)
-                self.log_message.emit(f"Connected. Setting up subscriptions...")
+                self.log_message.emit(f"Connected. Requesting Aggressive Server Subscriptions...")
                 self.connection_status.emit(True)
                 reconnect_delay = 5.0
                 
-                # 1. Setup Subscription
                 handler = OPCSubscriptionHandler(self)
-                sub = await client.create_subscription(self.interval_ms, handler)
                 
-                # 2. Subscribe to Nodes in chunks (to respect server limits)
+                params = ua.CreateSubscriptionParameters()
+                params.RequestedPublishingInterval = self.interval_ms
+                params.RequestedLifetimeCount = 10000
+                params.RequestedMaxKeepAliveCount = 3000
+                params.MaxNotificationsPerPublish = 10000
+                params.PublishingEnabled = True
+                params.Priority = 0
+                sub = await client.create_subscription(params, handler)
+                
                 nodes = [client.get_node(nid) for nid in self.selected_tags_nodeids]
                 CHUNK_SIZE = 50
+                
                 for i in range(0, len(nodes), CHUNK_SIZE):
                     chunk = nodes[i:i + CHUNK_SIZE]
-                    await sub.subscribe_data_change(chunk)
+                    await sub.subscribe_data_change(chunk, attr=ua.AttributeIds.Value)
                 
-                self.log_message.emit("✅ Successfully subscribed to all tags! Listening for live changes...")
+                self.log_message.emit("✅ Successfully subscribed! Listening for active value changes...")
 
-                # 3. Queue Processing Loop (Writes changes to DB as they arrive)
                 while self._is_running:
                     try:
-                        # Wait for the next datachange notification (with timeout to check _is_running)
                         nid, val, status, timestamp = await asyncio.wait_for(self.data_queue.get(), timeout=1.0)
                         
                         points_to_write = []
-                        nids_and_vals = []
+                        ui_updates_dict = {} 
                         log_samples = []
 
-                        # Helper function to process a single item
                         def process_item(q_nid, q_val, q_status, q_ts):
                             tag_name = self.selected_tags.get(q_nid, q_nid)
                             
-                            # Check Status
                             if not q_status.is_good():
                                 if self._last_errors.get(q_nid) != q_status.name:
                                     self.log_message.emit(f"⚠️ Bad Quality '{tag_name}': {q_status.name}")
@@ -358,7 +357,6 @@ class OPCInfluxWorker(QThread):
                                 self.log_message.emit(f"✅ Recovered '{tag_name}'")
                                 del self._last_errors[q_nid]
 
-                            # Type conversion
                             meta = self.tag_metadata.get(q_nid, {"type": "Float"})
                             expected_type = meta.get("type", "Float")
                             final_val = None
@@ -368,7 +366,6 @@ class OPCInfluxWorker(QThread):
                                 else: final_val = float(q_val)
                             except: return False
 
-                            # Smoothing for Floats
                             if expected_type == "Float":
                                 if q_nid not in self.value_history:
                                     self.value_history[q_nid] = deque(maxlen=5)
@@ -381,36 +378,29 @@ class OPCInfluxWorker(QThread):
                             if final_val is not None:
                                 p = Point(self.db_measurement).time(q_ts, WritePrecision.NS).field(tag_name, final_val)
                                 points_to_write.append(p)
-                                nids_and_vals.append((q_nid, final_val))
+                                ui_updates_dict[q_nid] = final_val 
                                 if len(log_samples) < 3: log_samples.append(f"{tag_name}={final_val}")
                                 return True
                             return False
 
-                        # Process the first item
                         process_item(nid, val, status, timestamp)
 
-                        # Drain the rest of the queue instantly to batch them together!
-                        while not self.data_queue.empty():
+                        batch_count = 0
+                        while not self.data_queue.empty() and batch_count < 200:
                             try:
                                 q_nid, q_val, q_status, q_ts = self.data_queue.get_nowait()
                                 process_item(q_nid, q_val, q_status, q_ts)
+                                batch_count += 1
                             except asyncio.QueueEmpty:
                                 break
 
-                        # Write Batch to InfluxDB
                         if points_to_write:
                             write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=points_to_write)
-                            
-                            # Update UI
-                            for n, fv in nids_and_vals:
-                                self.live_data_update.emit(n, fv)
-                            self.data_written.emit(f"⚡ Sub Update: {', '.join(log_samples)} ({len(points_to_write)} updates)")
+                            self.live_data_update.emit(ui_updates_dict)
 
                     except asyncio.TimeoutError:
-                        # Just looping around to check if _is_running is still True
                         continue
 
-                # Cleanup Subscriptions when stopped
                 try:
                     await sub.delete()
                 except: pass
@@ -418,7 +408,7 @@ class OPCInfluxWorker(QThread):
             except Exception as e:
                 self.connection_status.emit(False)
                 if not self._is_running: break
-                self.log_message.emit(f"Connection error/lost: {e}. Retrying in {reconnect_delay}s...")
+                self.log_message.emit(f"Connection lost/error: {e}. Retrying in {reconnect_delay}s...")
                 try: await client.disconnect()
                 except: pass
                 await asyncio.sleep(reconnect_delay)
@@ -458,7 +448,8 @@ class SetpointWatcherWorker(QThread):
         influx = InfluxDBClient(
             url=self.influx_config['url'],
             token=self.influx_config['token'],
-            org=self.influx_config['org']
+            org=self.influx_config['org'],
+            timeout=5000
         )
         query_api = influx.query_api()
 
@@ -475,8 +466,8 @@ class SetpointWatcherWorker(QThread):
                     nd = client.get_node(nid)
                     cached_nodes[nid] = nd
                     cached_types[nid] = await nd.read_data_type_as_variant_type()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.log_msg.emit(f"Watcher Error caching node {nid}: {e}")
 
             while self.running:
                 q = f'from(bucket:"{self.influx_bucket}") |> range(start: -24h) |> filter(fn: (r) => r["_measurement"] == "{self.write_back_meas}") |> last()'
@@ -495,11 +486,14 @@ class SetpointWatcherWorker(QThread):
                         last_cmd.update(new_cmd)
 
                 except Exception as e:
-                    self.log_msg.emit(f"Query Error: {e}")
+                    self.log_msg.emit(f"Watcher Query Error: {e}")
                     await asyncio.sleep(1)
 
                 for field_name, val in last_cmd.items():
-                    target_id = self.allowed_setpoints_map.get(field_name, field_name)
+                    target_id = self.allowed_setpoints_map.get(field_name)
+                    if not target_id:
+                        continue
+                        
                     if target_id in self.valid_node_ids and target_id in cached_nodes:
                         try:
                             node = cached_nodes[target_id]
@@ -508,7 +502,7 @@ class SetpointWatcherWorker(QThread):
                             await asyncio.wait_for(node.write_value(dv), timeout=5.0)
                             
                             if last_logged_writes.get(target_id) != val:
-                                self.log_msg.emit(f"--> WROTE: {target_id} = {val}")
+                                self.log_msg.emit(f"--> WROTE: {target_id} ({field_name}) = {val}")
                                 last_logged_writes[target_id] = val
                         except Exception as e:
                             if last_logged_writes.get(target_id) != "ERROR":
@@ -519,7 +513,8 @@ class SetpointWatcherWorker(QThread):
         except Exception as e:
             self.log_msg.emit(f"Watcher Error: {e}")
         finally:
-            await client.disconnect()
+            try: await client.disconnect()
+            except: pass
             influx.close()
 
     def run(self):
@@ -534,7 +529,7 @@ class SimulatorWorker(QThread):
     log_message = pyqtSignal(str)
     worker_finished = pyqtSignal()
     data_written = pyqtSignal(str)
-    live_data_update = pyqtSignal(str, object)
+    live_data_update = pyqtSignal(dict) 
 
     def __init__(self, influx_config, csv_file_path, db_measurement='kiln1'):
         super().__init__()
@@ -550,8 +545,8 @@ class SimulatorWorker(QThread):
     def run(self):
         try:
             client = InfluxDBClient(url=self.influx_config['url'], token=self.influx_config['token'],
-                                    org=self.influx_config['org'])
-            write_api = client.write_api(write_options=SYNCHRONOUS)
+                                    org=self.influx_config['org'], timeout=5000)
+            write_api = client.write_api(write_options=ASYNCHRONOUS)
 
             with open(self.csv_file_path, 'r', encoding='utf-8-sig') as f:
                 reader = csv.reader(f)
@@ -565,21 +560,19 @@ class SimulatorWorker(QThread):
                 display = []
                 point = Point(self.db_measurement).time(ts, WritePrecision.NS)
                 valid_row = False
+                ui_dict = {}
 
                 for i, col in enumerate(headers):
                     if i >= len(row): continue
                     raw = row[i].strip()
                     val = None
-                    try:
-                        val = float(raw)
+                    try: val = float(raw)
                     except ValueError:
-                        try:
-                            val = float(raw.replace(',', '.'))
-                        except ValueError:
-                            continue
+                        try: val = float(raw.replace(',', '.'))
+                        except ValueError: continue
 
                     point.field(col.strip(), val)
-                    self.live_data_update.emit(col.strip(), val)
+                    ui_dict[col.strip()] = val
 
                     if len(display) < 3: display.append(f"{col}={val}")
                     valid_row = True
@@ -587,6 +580,7 @@ class SimulatorWorker(QThread):
                 if valid_row:
                     try:
                         write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
+                        self.live_data_update.emit(ui_dict)
                         self.data_written.emit(f"✅ Sim Write: {', '.join(display)}...")
                     except Exception as e:
                         self.log_message.emit(f"Sim Write Error: {e}")
@@ -619,8 +613,7 @@ class APIWorker(QThread):
         @app_api.post("/write")
         async def opc_write(request: WriteRequest):
             client = self.get_opc_client()
-            if not client:
-                raise HTTPException(503, "Not connected to OPC Server")
+            if not client: raise HTTPException(503, "Not connected to OPC Server")
             try:
                 node = client.get_node(request.node_id)
                 await node.write_value(float(request.value) if isinstance(request.value, (int, float, str)) else request.value)
@@ -630,7 +623,6 @@ class APIWorker(QThread):
 
         config = uvicorn.Config(app_api, host="0.0.0.0", port=self.port, log_level="error")
         self.server = uvicorn.Server(config)
-        
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -644,8 +636,7 @@ class APIWorker(QThread):
             loop.close()
 
     def stop(self):
-        if self.server:
-            self.server.should_exit = True
+        if self.server: self.server.should_exit = True
 
 
 # --- PI WEB API HELPERS ---
@@ -705,8 +696,7 @@ class PITagSearchDialog(QDialog):
 
     def _do_search(self):
         q = self.search_input.text().strip()
-        if not q:
-            return
+        if not q: return
         self.status_label.setText("Searching...")
         self.search_btn.setEnabled(False)
         self.results_tree.clear()
@@ -733,8 +723,7 @@ class PITagSearchDialog(QDialog):
         selected = []
         for item in self.results_tree.selectedItems():
             selected.append({'name': item.text(0), 'webId': item.text(1), 'alias': item.text(0)})
-        if selected:
-            self.tags_added.emit(selected)
+        if selected: self.tags_added.emit(selected)
         self.accept()
 
 
@@ -742,7 +731,7 @@ class PITagSearchDialog(QDialog):
 class PIInfluxWorker(QThread):
     log_message = pyqtSignal(str)
     data_written = pyqtSignal(str)
-    live_data_update = pyqtSignal(str, object)
+    live_data_update = pyqtSignal(dict) 
     worker_finished = pyqtSignal()
 
     def __init__(self, pi_url, pi_user, pi_password, influx_config, pi_tags, interval_sec, use_api_key=False, pi_api_key="", db_measurement='kiln1'):
@@ -767,9 +756,10 @@ class PIInfluxWorker(QThread):
             influx = InfluxDBClient(
                 url=self.influx_config['url'],
                 token=self.influx_config['token'],
-                org=self.influx_config['org']
+                org=self.influx_config['org'],
+                timeout=5000
             )
-            write_api = influx.write_api(write_options=SYNCHRONOUS)
+            write_api = influx.write_api(write_options=ASYNCHRONOUS)
             self.log_message.emit(f"PI Gateway started → {self.db_measurement}")
 
             web_ids = [t['webId'] for t in self.pi_tags]
@@ -781,6 +771,7 @@ class PIInfluxWorker(QThread):
                     ts = datetime.now(timezone.utc)
                     point = Point(self.db_measurement).time(ts, WritePrecision.NS)
                     log_samples = []
+                    ui_dict = {}
 
                     if use_stream_url_mode:
                         for t in self.pi_tags:
@@ -788,7 +779,7 @@ class PIInfluxWorker(QThread):
                             alias = alias_map.get(t['webId'], t.get('alias', t['name']))
                             try:
                                 auth = None if self.use_api_key else (self.pi_user, self.pi_password)
-                                resp = requests.get(stream_url, auth=auth, verify=False, timeout=10)
+                                resp = requests.get(stream_url, auth=auth, verify=False, timeout=5)
                                 resp.raise_for_status()
                                 data = resp.json()
                                 
@@ -801,10 +792,9 @@ class PIInfluxWorker(QThread):
                                 try:
                                     val = float(raw)
                                     point.field(alias, val)
-                                    self.live_data_update.emit(t['webId'], val)
+                                    ui_dict[t['webId']] = val
                                     if len(log_samples) < 3: log_samples.append(f"{alias}={val}")
-                                except (ValueError, TypeError):
-                                    continue
+                                except (ValueError, TypeError): continue
                             except Exception as e:
                                 self.log_message.emit(f"PI Stream Error [{alias}]: {e}")
                     else:
@@ -823,17 +813,13 @@ class PIInfluxWorker(QThread):
                             try:
                                 val = float(raw)
                                 point.field(alias, val)
-                                self.live_data_update.emit(wid, val)
+                                ui_dict[wid] = val
                                 if len(log_samples) < 3: log_samples.append(f"{alias}={val}")
-                            except (ValueError, TypeError):
-                                continue
+                            except (ValueError, TypeError): continue
 
-                    write_api.write(
-                        bucket=self.influx_config['bucket'],
-                        org=self.influx_config['org'],
-                        record=point
-                    )
-                    self.data_written.emit(f"✅ PI: {', '.join(log_samples)}...")
+                    write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
+                    self.live_data_update.emit(ui_dict)
+                    # self.data_written.emit(f"✅ PI: {', '.join(log_samples)}...")
 
                 except Exception as e:
                     self.log_message.emit(f"PI Read Error: {e}")
@@ -901,10 +887,8 @@ class MainWindow(QMainWindow):
     def _load_selections(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
+                with open(CONFIG_FILE, 'r') as f: return json.load(f)
+            except: pass
         return {}
 
     def _save_selections(self):
@@ -931,10 +915,8 @@ class MainWindow(QMainWindow):
         self.selections["opc_browse_path"] = self.opc_browse_path_input.text()
         self.selections["write_interval"] = self.write_interval_spinbox.value()
         try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.selections, f, indent=4)
-        except:
-            pass
+            with open(CONFIG_FILE, 'w') as f: json.dump(self.selections, f, indent=4)
+        except: pass
 
     def _setup_menu(self):
         menu = self.menuBar().addMenu("&File")
@@ -949,16 +931,26 @@ class MainWindow(QMainWindow):
 
     def _parse_model_json(self, path):
         try:
-            with open(path, 'r') as f:
-                data = json.load(f)
+            with open(path, 'r') as f: data = json.load(f)
             self.model_setpoints = {}
             for k, v in data.get("control_variables", {}).items():
                 if v.get("is_setpoint"):
-                    self.model_setpoints[k] = v.get("tag_name")
-                    self.output_tags.add(v.get("tag_name"))
+                    target_name = v.get("tag_name")
+                    self.output_tags.add(target_name)
+                    matched_nid = None
+                    for nid, opc_name in self.selected_opc_tags.items():
+                        if opc_name == target_name:
+                            matched_nid = nid
+                            break
+                    
+                    if matched_nid:
+                        self.model_setpoints[k] = matched_nid
+                    else:
+                        self.log_widget.appendPlainText(f"⚠️ Warning: Model requires '{target_name}' but it is not mapped to a Node ID.")
+
             self.status_bar.showMessage(f"Loaded {len(self.model_setpoints)} setpoints", 4000)
             self.watcher_chk.setEnabled(True)
-            self.watcher_chk.setText(f"Enable Automated Write-Back ({len(self.model_setpoints)} tags)")
+            self.watcher_chk.setText(f"Enable Automated Write-Back ({len(self.model_setpoints)} mapped tags)")
             self._update_selected_tags_list_widget()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -1221,7 +1213,7 @@ class MainWindow(QMainWindow):
         g_tags.setLayout(l_tags)
         right.addWidget(g_tags)
 
-        g_pi_tags = QGroupBox("OSI PI Tags (PI \u2192 InfluxDB kiln1)")
+        g_pi_tags = QGroupBox("OSI PI Tags (PI \u2192 InfluxDB)")
         l_pi = QVBoxLayout()
         self.pi_tags_tree = QTreeWidget()
         self.pi_tags_tree.setHeaderLabels(["PI Tag Name", "Alias (InfluxDB Field)", "WebID", "Last Value"])
@@ -1752,157 +1744,23 @@ class MainWindow(QMainWindow):
             self.pi_worker = None
         self.start_pi_button.setEnabled(True)
 
-    @pyqtSlot(str, object)
-    def _on_pi_live_update(self, web_id, value):
-        item = self.pi_tag_item_map.get(web_id)
-        if item: item.setText(3, f"{value:.3f}" if isinstance(value, float) else str(value))
-
-    def start_simulator(self):
-        self.start_simulator_button.setEnabled(False)
-        self.stop_simulator_button.setEnabled(True)
-        self.connect_opc_button.setEnabled(False) 
-
-        conf = {'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
-                'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()}
-        self.simulator_worker = SimulatorWorker(conf, self.csv_file_path, db_measurement=self.opc_measurement_input.text())
-        self.simulator_worker.log_message.connect(self.log_widget.appendPlainText)
-        self.simulator_worker.data_written.connect(lambda x: self.status_bar.showMessage(x, 2000))
-        self.simulator_worker.live_data_update.connect(self._on_live_data_update)
-        self.simulator_worker.worker_finished.connect(self.stop_simulator)
-        self.simulator_worker.start()
-
-    def stop_simulator(self):
-        self.stop_simulator_button.setEnabled(False)
-        if self.simulator_worker: 
-            try: self.simulator_worker.log_message.disconnect()
-            except: pass
-            self.simulator_worker.stop()
-            self.simulator_worker = None
-        self.start_simulator_button.setEnabled(bool(self.csv_file_path))
-        self.connect_opc_button.setEnabled(self.opc_client is None) 
-
-    def toggle_write_watcher(self, checked):
-        if checked:
-            if not self.model_setpoints: return self.watcher_chk.setChecked(False)
-            conf = self._get_opc_config()
-            influx_conf = {
-                'url': self.influx_url_input.text(), 'token': self.influx_token_input.text(),
-                'org': self.influx_org_input.text(), 'bucket': self.influx_bucket_input.text()
-            }
-            wb_meas = getattr(config, 'DB_MEASUREMENT_SETPOINTS', 'kiln2') if config is not None else 'kiln2'
-            self.log_widget.appendPlainText(f"Starting Setpoint Watcher using measurement: {wb_meas}")
-            self.watcher_worker = SetpointWatcherWorker(conf, influx_conf, self.model_setpoints, db_measurement=wb_meas)
-            self.watcher_worker.log_msg.connect(self.log_widget.appendPlainText)
-            self.watcher_worker.start()
-            self.watcher_status.setText("Status: Running")
-            self.watcher_status.setStyleSheet("color: #4caf50;")
-        else:
-            if self.watcher_worker: self.watcher_worker.stop()
-            self.watcher_status.setText("Status: Stopped")
-            self.watcher_status.setStyleSheet("")
-
-    @qasync.asyncSlot()
-    async def _on_write_button_clicked(self):
-        nid = self.write_tag_combo.currentData()
-        val = self.write_value_input.text()
-        if not nid or not val: return
-
-        self.write_button.setEnabled(False)
-        try:
-            node = self.opc_client.get_node(nid)
-            await node.write_value(float(val))
-            QMessageBox.information(self, "Success", f"Wrote {val}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-        finally:
-            self.write_button.setEnabled(True)
-
-    @qasync.asyncSlot()
-    async def test_influxdb_connection(self):
-        self.influx_test_button.setEnabled(False)
-        try:
-            c = InfluxDBClient(url=self.influx_url_input.text(), token=self.influx_token_input.text(),
-                               org=self.influx_org_input.text())
-            if c.ping():
-                self.influx_connection_status_label.setText("Status: Connected")
-                self.influx_connection_status_label.setStyleSheet("color: #4caf50;")
-            else:
-                raise Exception("Ping Failed")
-        except Exception as e:
-            self.influx_connection_status_label.setText("Status: Failed")
-            self.influx_connection_status_label.setStyleSheet("color: #f44336;")
-        finally:
-            self.influx_test_button.setEnabled(True)
+    @pyqtSlot(dict)
+    def _on_live_data_update(self, updates_dict):
+        # Only updates the OPC UA window
+        for nodeid, value in updates_dict.items():
+            item = self.tag_item_map.get(nodeid)
+            if item:
+                val_str = f"{value:.3f}" if isinstance(value, float) else str(value)
+                item.setText(4, val_str)
 
     @pyqtSlot(dict)
-    def _on_tags_selected(self, tags):
-        for nid, name in tags.items():
-            self.selected_opc_tags[nid] = name
-            if nid not in self.tag_metadata:
-                self.tag_metadata[nid] = {"type": "Float"}
-        self._update_selected_tags_list_widget()
-        self._save_selections()
-
-    def _update_selected_tags_list_widget(self):
-        self.selected_tags_tree.clear()
-        self.write_tag_combo.clear()
-        self.tag_item_map.clear()
-        self.pi_tag_item_map.clear()
-
-        for nid, name in self.selected_opc_tags.items():
-            mode_str = "[OUTPUT]" if nid in self.output_tags else "[INPUT]"
-            meta = self.tag_metadata.get(nid, {"type": "Float"})
-            type_str = f"[{meta.get('type', 'Float')}]"
-            
-            item = QTreeWidgetItem([name, nid, mode_str, type_str, "---"])
-            item.setData(1, Qt.ItemDataRole.UserRole, nid)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-            item.setForeground(2, QColor("#61dafb"))
-            item.setForeground(3, QColor("#ffcc00"))
-            
-            self.selected_tags_tree.addTopLevelItem(item)
-            self.tag_item_map[nid] = item
-            if nid in self.output_tags: self.write_tag_combo.addItem(f"{name} ({nid})", userData=nid)
-
-        for tag in self.pi_tags:
-            wid = tag.get('webId', '')
-            name = tag.get('name', 'Unknown')
-            alias = tag.get('alias', name)
-            
-            item = QTreeWidgetItem([alias, wid, "[PI-IN]", "[Float]", "---"])
-            item.setData(1, Qt.ItemDataRole.UserRole, wid)
-            item.setForeground(2, QColor("#a6e3a1"))
-            self.selected_tags_tree.addTopLevelItem(item)
-            self.pi_tag_item_map[wid] = item
-
-        self._update_write_combo()
-
-    def _on_tag_item_clicked(self, item, column):
-        nid = item.data(1, Qt.ItemDataRole.UserRole)
-        if not nid: return
-        
-        if column == 2:
-            if nid in self.output_tags: self.output_tags.remove(nid)
-            else: self.output_tags.add(nid)
-            self._update_selected_tags_list_widget()
-            self._save_selections()
-        elif column == 3:
-            types = ["Float", "String", "Bool"]
-            curr = self.tag_metadata.get(nid, {"type": "Float"}).get("type", "Float")
-            next_type = types[(types.index(curr) + 1) % len(types)]
-            self.tag_metadata[nid] = {"type": next_type}
-            self._update_selected_tags_list_widget()
-            self._save_selections()
-
-    @pyqtSlot(str, object)
-    def _on_live_data_update(self, nodeid, value):
-        item = self.tag_item_map.get(nodeid) or self.pi_tag_item_map.get(nodeid)
-        if item:
-            if isinstance(value, float):
-                val_str = f"{value:.3f}"
-            else:
-                val_str = str(value)
-            item.setText(4, val_str)
+    def _on_pi_live_update(self, updates_dict):
+        # Only updates the OSI PI window
+        for web_id, value in updates_dict.items():
+            item = self.pi_tag_item_map.get(web_id)
+            if item: 
+                val_str = f"{value:.3f}" if isinstance(value, float) else str(value)
+                item.setText(3, val_str)
 
     def _on_tag_name_changed(self, item, column):
         if column != 0: return
@@ -2027,24 +1885,9 @@ class MainWindow(QMainWindow):
         self.start_api_button.setEnabled(True)
 
     def closeEvent(self, e):
-        try:
-            if self.opc_worker: self.opc_worker.stop()
-            if self.pi_worker: self.pi_worker.stop()
-            if self.simulator_worker: self.simulator_worker.stop()
-            if self.watcher_worker: self.watcher_worker.stop()
-            if hasattr(self, 'api_worker') and self.api_worker: self.api_worker.stop()
-            
-            workers = [self.opc_worker, self.pi_worker, self.simulator_worker, self.watcher_worker]
-            if hasattr(self, 'api_worker'): workers.append(self.api_worker)
-            
-            for w in workers:
-                if w and w.isRunning(): w.wait(200)
-            
-            self._save_selections()
-        except Exception as ex:
-            logging.error(f"Error during shutdown: {ex}")
-            
-        e.accept()
+        # Prevent UI freezing on close! Immediately exits the Python process.
+        self.status_bar.showMessage("Shutting down...", 5000)
+        QApplication.processEvents()
         os._exit(0)
 
 
